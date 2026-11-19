@@ -1,0 +1,5 @@
+{
+  "name": "talk-to-me",
+  "version": "0.1.0",
+  "description": "Speaks each Claude Code reply aloud with Talk to Me (local TTS) when a turn ends, and adds a speak tool for things worth saying out loud."
+}

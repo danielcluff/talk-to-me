@@ -12,6 +12,16 @@ const markdown = @import("text/markdown.zig");
 
 pub const default_port: u16 = 9932;
 
+/// Per-source behavior (key: source app, e.g. "claude-code", "codex").
+pub const SourceSettings = struct {
+    /// false: jobs from this source are dropped ("muted")
+    enabled: bool = true,
+    /// empty: the global voice
+    voice: []const u8 = "",
+    /// say who is speaking first, e.g. "Claude, in talk-to-me."
+    announce: bool = false,
+};
+
 pub const Settings = struct {
     model: []const u8 = "kokoro",
     /// empty: the model's default voice
@@ -23,7 +33,20 @@ pub const Settings = struct {
     tables: markdown.Tables = .announce,
     /// identical text from the same source within this window is dropped
     dedupe_seconds: u32 = 30,
+    sources: std.json.ArrayHashMap(SourceSettings) = .{},
 };
+
+/// Spoken and displayed name of a source app.
+pub fn sourceName(app: []const u8) []const u8 {
+    const names = .{
+        .{ "claude-code", "Claude" }, .{ "codex", "Codex" },   .{ "opencode", "OpenCode" },
+        .{ "herdr", "Herdr" },         .{ "browser", "Browser" }, .{ "mcp", "Agent" },
+    };
+    inline for (names) |n| {
+        if (std.mem.eql(u8, app, n[0])) return n[1];
+    }
+    return app;
+}
 
 pub const Paths = struct {
     root: []const u8,

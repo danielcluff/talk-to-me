@@ -1,0 +1,18 @@
+{
+  "description": "Read the final reply of each turn aloud with Talk to Me",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "talktome",
+            "args": ["hook", "claude"],
+            "async": true,
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}

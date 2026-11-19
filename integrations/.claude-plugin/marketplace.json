@@ -1,0 +1,12 @@
+{
+  "name": "talk-to-me",
+  "owner": { "name": "Talk to Me" },
+  "metadata": { "description": "Local text-to-speech for Claude Code replies." },
+  "plugins": [
+    {
+      "name": "talk-to-me",
+      "source": "./claude-code",
+      "description": "Speaks each Claude Code reply aloud with Talk to Me when a turn ends, and adds a speak tool."
+    }
+  ]
+}

@@ -357,6 +357,14 @@ const SettingsPatch = struct {
     code_blocks: ?@import("text/markdown.zig").CodeBlocks = null,
     tables: ?@import("text/markdown.zig").Tables = null,
     dedupe_seconds: ?u32 = null,
+    /// merged per source: {"sources": {"codex": {"voice": "am_michael"}}}
+    sources: ?std.json.ArrayHashMap(SourcePatch) = null,
+};
+
+const SourcePatch = struct {
+    enabled: ?bool = null,
+    voice: ?[]const u8 = null,
+    announce: ?bool = null,
 };
 
 fn patchSettings(s: *Server, req: *Exchange, a: std.mem.Allocator) !void {
@@ -378,6 +386,16 @@ fn patchSettings(s: *Server, req: *Exchange, a: std.mem.Allocator) !void {
     if (patch.code_blocks) |v| settings.code_blocks = v;
     if (patch.tables) |v| settings.tables = v;
     if (patch.dedupe_seconds) |v| settings.dedupe_seconds = v;
+    if (patch.sources) |sp| {
+        var it = sp.map.iterator();
+        while (it.next()) |e| {
+            var cur = settings.sources.map.get(e.key_ptr.*) orelse config.SourceSettings{};
+            if (e.value_ptr.enabled) |v| cur.enabled = v;
+            if (e.value_ptr.voice) |v| cur.voice = v;
+            if (e.value_ptr.announce) |v| cur.announce = v;
+            try settings.sources.map.put(a, e.key_ptr.*, cur);
+        }
+    }
     s.core.setSettings(settings) catch |err| return sendError(req, a, .internal_server_error, @errorName(err));
     return sendJson(req, a, .ok, try s.core.getSettings(a));
 }

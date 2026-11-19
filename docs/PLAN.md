@@ -691,6 +691,51 @@ dragging files onto the app in Finder).
 - *Done when:* finishing a turn in each agent speaks the reply with that
   source's voice.
 
+**Phase 4 progress (in progress, 2026-11-19)**
+
+Done:
+- Confirmed every hook format against its source:
+  - Claude Code's Stop hook gives `last_assistant_message` and supports
+    `"async": true`.
+  - Codex's notify payload has `type: "agent-turn-complete"`,
+    `last-assistant-message`, `cwd` and `thread-id`.
+  - OpenCode loads global plugins from `~/.config/opencode/plugins/`, and the
+    `session.idle` event carries `sessionID`.
+  - herdr mods are JS with `agents()` and `fetch`.
+- Per-source settings: `settings.sources.<app>` with `enabled`, `voice` and
+  `announce`, applied in `core.speak`. They can be patched via
+  `PATCH /v1/settings {"sources": {...}}`.
+- `integrations/`:
+  - the Claude Code marketplace and plugin (Stop hook and MCP server); both
+    validate with `claude plugin validate`
+  - the OpenCode plugin (`talk-to-me.ts`)
+  - the herdr mod (a status bar with pause and stop that announces agents
+    without native hooks); it passes `herdr-app check`
+
+Left to do:
+- `src/integrations.zig`:
+  - `talktome hook claude|codex|opencode`. Policy `replace`, label is the cwd
+    basename, session from the payload. Claude falls back to `transcript_path`.
+    Codex `--chain` runs the previous notify program. Hooks always exit 0.
+  - `talktome mcp [--app NAME]`: a stdio JSON-RPC server with the tools
+    `speak`, `stop` and `list_voices`. It replaces the planned HTTP `/mcp` so
+    the token stays out of agent config files.
+  - `talktome install|uninstall claude|codex|opencode|herdr` and
+    `talktome integrations [--json]`:
+    - Copy `integrations/` to the support dir, with absolute `talktome` paths.
+    - Claude: `claude plugin marketplace add`, then `install`.
+    - Codex: rewrite the top-level `notify` with a backup, keeping the
+      existing entry through `--chain`.
+    - OpenCode: write the plugin file.
+    - herdr: copy the mod and run `herdr-app check`.
+  - Main's helpers are already `pub` for this.
+- Install `integrations/` into `zig-out/share/talk-to-me/` and the app's
+  Resources.
+- A Sources page in Settings: per-agent enable, voice and announce, plus
+  install status and buttons (call the bundled `talktome install`).
+- Test against a temporary HOME before touching real configs, and ask before
+  installing into the real `~/.codex`, `~/.claude`, OpenCode and herdr.
+
 **Phase 5: browser**
 - Fork the extension, add pairing, SSE highlighting, and ChatGPT and Claude
   auto-read.

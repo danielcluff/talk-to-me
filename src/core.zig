@@ -256,6 +256,13 @@ pub const Core = struct {
         var out = s;
         out.model = try a.dupe(u8, s.model);
         out.voice = try a.dupe(u8, s.voice);
+        out.sources = .{};
+        var it = s.sources.map.iterator();
+        while (it.next()) |e| {
+            var v = e.value_ptr.*;
+            v.voice = try a.dupe(u8, v.voice);
+            try out.sources.map.put(a, try a.dupe(u8, e.key_ptr.*), v);
+        }
         return out;
     }
 
@@ -439,6 +446,25 @@ pub const Core = struct {
             self.gpa.destroy(j);
             return .{ .dropped = "nothing to speak" };
         }
+        // per-source settings: mute, voice, announcement
+        const src = s.sources.map.get(req.source.app);
+        if (src) |ss| if (!ss.enabled) {
+            j.arena.deinit();
+            self.gpa.destroy(j);
+            return .{ .dropped = "muted" };
+        };
+        if (src) |ss| if (ss.announce) {
+            const who = config.sourceName(req.source.app);
+            const intro = if (req.source.label.len > 0)
+                try std.fmt.allocPrint(a, "{s}, in {s}.", .{ who, req.source.label })
+            else
+                try std.fmt.allocPrint(a, "{s}.", .{who});
+            const with = try a.alloc(chunker.Chunk, j.chunks.len + 1);
+            with[0] = .{ .text = intro, .pause_after_ms = 150 };
+            @memcpy(with[1..], j.chunks);
+            j.chunks = with;
+        };
+        const source_voice: ?[]const u8 = if (src) |ss| (if (ss.voice.len > 0) ss.voice else null) else null;
         j.audio = try a.alloc(?[]f32, j.chunks.len);
         @memset(j.audio, null);
         j.source = .{
@@ -446,9 +472,10 @@ pub const Core = struct {
             .label = try a.dupe(u8, req.source.label),
             .session = try a.dupe(u8, req.source.session),
         };
-        j.voice = try a.dupe(u8, req.voice orelse "");
+        j.voice = try a.dupe(u8, req.voice orelse source_voice orelse "");
         j.speed = req.speed orelse s.speed;
-        j.preview = j.chunks[0].text[0..@min(j.chunks[0].text.len, 119)];
+        const first = j.chunks[if (j.chunks.len > 1 and src != null and src.?.announce) 1 else 0].text;
+        j.preview = first[0..@min(first.len, 119)];
         j.hash = hashText(j.source.app, j.chunks);
         j.created_ms = self.nowMs();
 

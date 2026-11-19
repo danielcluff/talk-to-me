@@ -16,7 +16,7 @@ pub const std_options: std.Options = .{
     .log_level = .info,
 };
 
-const usage =
+pub const usage =
     \\Usage: talktome [options] [TEXT | FILE.md | FILE.txt]
     \\       some-command | talktome [options]
     \\       talktome <command> [args]
@@ -53,7 +53,7 @@ const usage =
     \\
 ;
 
-const Ctx = struct {
+pub const Ctx = struct {
     gpa: std.mem.Allocator,
     arena: std.mem.Allocator,
     io: Io,
@@ -115,19 +115,19 @@ fn run(init: std.process.Init) !void {
     return speak(&ctx, args.items);
 }
 
-fn eql(a: []const u8, b: []const u8) bool {
+pub fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-fn out(io: Io, text: []const u8) !void {
+pub fn out(io: Io, text: []const u8) !void {
     try Io.File.stdout().writeStreamingAll(io, text);
 }
 
-fn outf(ctx: *Ctx, comptime fmt: []const u8, args: anytype) !void {
+pub fn outf(ctx: *Ctx, comptime fmt: []const u8, args: anytype) !void {
     try out(ctx.io, try std.fmt.allocPrint(ctx.arena, fmt, args));
 }
 
-fn fail(ctx: *Ctx, comptime fmt: []const u8, args: anytype) error{Reported} {
+pub fn fail(ctx: *Ctx, comptime fmt: []const u8, args: anytype) error{Reported} {
     const msg = std.fmt.allocPrint(ctx.arena, "talktome: " ++ fmt ++ "\n", args) catch "talktome: error\n";
     Io.File.stderr().writeStreamingAll(ctx.io, msg) catch {};
     return error.Reported;
@@ -156,7 +156,7 @@ fn serve(ctx: *Ctx, settings: config.Settings, rest: []const []const u8) !void {
 
 const Response = struct { status: std.http.Status, body: []const u8 };
 
-fn rawRequest(ctx: *Ctx, method: std.http.Method, path: []const u8, payload: ?[]const u8) !Response {
+pub fn rawRequest(ctx: *Ctx, method: std.http.Method, path: []const u8, payload: ?[]const u8) !Response {
     var client: std.http.Client = .{ .allocator = ctx.gpa, .io = ctx.io };
     defer client.deinit();
     var body: Io.Writer.Allocating = .init(ctx.arena);
@@ -178,7 +178,7 @@ fn rawRequest(ctx: *Ctx, method: std.http.Method, path: []const u8, payload: ?[]
 }
 
 /// Request that must succeed (2xx); prints the server's error otherwise.
-fn request(ctx: *Ctx, method: std.http.Method, path: []const u8, payload: ?[]const u8) ![]const u8 {
+pub fn request(ctx: *Ctx, method: std.http.Method, path: []const u8, payload: ?[]const u8) ![]const u8 {
     const res = rawRequest(ctx, method, path, payload) catch |err|
         return fail(ctx, "cannot reach the server on port {d}: {t}", .{ ctx.port, err });
     if (@intFromEnum(res.status) >= 300) {
@@ -215,7 +215,7 @@ fn openApp(ctx: *Ctx) bool {
 
 /// Make sure a server is running (start one in the background if not) and
 /// load the token.
-fn ensureServer(ctx: *Ctx) !void {
+pub fn ensureServer(ctx: *Ctx) !void {
     if (!healthy(ctx) and openApp(ctx)) {
         // the app hosts the server; give it a moment to come up
         var waited: u32 = 0;

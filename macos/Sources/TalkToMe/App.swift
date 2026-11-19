@@ -12,12 +12,26 @@ struct TalkToMeApp: App {
             MenuContent()
                 .environmentObject(core)
         } label: {
-            // waveform while speaking; dimmed when no model is installed
-            Image(systemName: core.isSpeaking ? "waveform" : "waveform.circle")
+            // the waveform is the icon; it pulses while speaking and is
+            // dimmed when no model is installed
+            Image(nsImage: MenuBarIcon.image)
+                .symbolEffect(.variableColor.iterative, isActive: core.isSpeaking)
                 .opacity(core.hasInstalledModel || core.models.isEmpty ? 1 : 0.5)
         }
         .menuBarExtraStyle(.menu)
     }
+}
+
+enum MenuBarIcon {
+    /// Larger than the default menu bar symbol size; a template image so it
+    /// follows the menu bar's light/dark appearance.
+    static let image: NSImage = {
+        let config = NSImage.SymbolConfiguration(pointSize: 17, weight: .semibold)
+        let img = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Talk to Me")!
+            .withSymbolConfiguration(config)!
+        img.isTemplate = true
+        return img
+    }()
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -70,8 +84,6 @@ struct MenuContent: View {
         Divider()
 
         queueMenu
-        voiceMenu
-        speedMenu
         Divider()
 
         Button("Settings…") { SettingsWindow.shared.show(.general) }
@@ -105,36 +117,6 @@ struct MenuContent: View {
             }
             ForEach(queued) { job in
                 Button("✕  \(appName(job.app)): \(String(job.preview.prefix(50)))") { core.removeJob(job.id) }
-            }
-        }
-    }
-
-    @ViewBuilder private var voiceMenu: some View {
-        Menu("Voice") {
-            if core.voices.isEmpty {
-                Text(core.hasInstalledModel ? "Open Settings → Voices" : "No model installed")
-            }
-            ForEach(core.voices) { v in
-                Button {
-                    core.update(["voice": v.name])
-                } label: {
-                    if v.default { Image(systemName: "checkmark") }
-                    Text("\(v.displayName)  (\(v.accent) \(v.gender))")
-                }
-            }
-        }
-        .task { if core.voices.isEmpty { await core.refreshVoices() } }
-    }
-
-    @ViewBuilder private var speedMenu: some View {
-        Menu("Speed") {
-            ForEach([0.8, 1.0, 1.2, 1.5], id: \.self) { s in
-                Button {
-                    core.update(["speed": s])
-                } label: {
-                    if abs(core.settings.speed - s) < 0.01 { Image(systemName: "checkmark") }
-                    Text(String(format: "%.1f×", s))
-                }
             }
         }
     }

@@ -73,6 +73,7 @@ struct SettingsView: View {
                     .padding(.vertical, 3)
             }
             .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 240)
+            .toolbar(removing: .sidebarToggle) // the page list always stays visible
         } detail: {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {

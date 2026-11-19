@@ -110,16 +110,31 @@ Swift/SwiftUI app wraps it on macOS.
   playback (configurable), so pausing never wastes GPU time.
 
 ### Build
-- `vendor/llama.cpp` is a git submodule pinned to a commit.
-- CMake builds llama.cpp static with `GGML_METAL=ON`,
-  `GGML_METAL_EMBED_LIBRARY=ON`, `BUILD_SHARED_LIBS=OFF`, `LLAMA_CURL=OFF`.
-  The **engine shim is built by the same CMake and compiler (Apple clang)**, so
-  every C++ object shares one libc++. Zig only ever sees a C ABI.
-- `zig build` runs the CMake step, compiles libtalk and `talktome`, and links
-  Metal, Foundation, Accelerate and AudioToolbox.
-- `zig build app` runs `xcodebuild` for the Swift shell, which links
-  `libtalk.a`.
-- Pins: Zig 0.17.0 (installed), macOS 14+, arm64 only.
+- `vendor/llama.cpp` is a git submodule pinned to `41d8297fe`.
+- `engine/CMakeLists.txt` builds llama.cpp static with `GGML_METAL=ON`,
+  `GGML_METAL_EMBED_LIBRARY=ON`, `BUILD_SHARED_LIBS=OFF`, `LLAMA_OPENSSL=OFF`,
+  and with tools, server and tests off.
+  - The **engine shim is built by the same CMake and compiler (Apple clang)**,
+    so every C++ object shares the system libc++.
+  - `libtool` merges the shim, mtmd, llama-common, llama, the ggml backends and
+    vendor-hash into one archive, `libtalk_engine_all.a` (27 MB).
+  - Zig only ever sees the C ABI in `engine/talk_engine.h`, through
+    `addTranslateC`.
+- **Final links use Apple's `clang++`/ld, not Zig's linker.** Zig 0.17's Mach-O
+  linker fails on the llama.cpp archive ("failed to resolve relocations and
+  write atoms: Overflow") in both debug and release. So Zig emits an object (or
+  `libtalk.a`), and `xcrun clang++` links it with the engine archive and
+  Foundation, Metal, MetalKit and Accelerate. Xcode will do the same for the
+  app.
+- `zig build` runs CMake, compiles the Zig code, and links through `appleLink()`
+  in `build.zig`.
+- `zig build app` (later) runs `xcodebuild` for the Swift shell, which links
+  `libtalk.a` plus the engine archive.
+- Pins: Zig 0.17.0, macOS 14.0 minimum (set in both CMake and `build.zig`), arm64
+  only.
+- Before shipping, set `GGML_NATIVE=OFF` with an explicit Apple Silicon
+  baseline. It currently builds with `-mcpu=native`, tuned to whichever M-chip
+  runs the build.
 
 ---
 
@@ -441,6 +456,52 @@ Each phase ends with something usable.
 - *Done when:* Zig produces correct Kokoro audio with Metal and we have the
   numbers. If it really is 2-3 s per sentence in-process, profile it
   (vocoder on GPU vs CPU, template cost) before going further.
+
+**Phase 0 results (done 2026-11-19, Apple M4, macOS 15.7)**
+
+Run with `zig build --release spike -- [--voice V] [--speed S] [--cpu] ["text"]`
+(source: `src/spike.zig`). Median of 3 runs, voice `af_heart`:
+
+| Text | Chars | Synthesis | Audio | Faster than real time |
+|---|---|---|---|---|
+| "Okay, done." | 11 | 0.59 s | 1.6 s | 2.7× |
+| short | 34 | 0.89 s | 2.4 s | 2.7× |
+| medium (~20 words) | 116 | 2.68 s | 7.3 s | 2.7× |
+| long | 204 | 4.69 s | 12.7 s | 2.7× |
+
+- Model load: **0.96 s**. First synthesis after load: 0.5–0.85 s. Peak RSS:
+  **430 MB**. The engine reports 54 voices, 24 kHz mono.
+- Nearly all the time (about 97%) is the vocoder (`GEN_WAV`). The phonemizer
+  template and backbone take 10–80 ms.
+- CPU-only is 1.9× faster than real time (613 MB RSS), so Metal is only about
+  1.4× faster than CPU. The vocoder graph runs entirely on Metal (1 split), so
+  it isn't falling back to the CPU. Its kernels are just slow.
+- The numbers match kokoro-reader's 2–3 s per sentence. `llama-server` wasn't
+  the bottleneck. Kokoro's vocoder in llama.cpp is.
+- Voice selection (`bm_george`) and speed (1.3×) work. The audio is clean
+  (RMS about 0.05, no clipping).
+
+**What this means for the design**
+- **2.7× faster than real time is enough.** With one chunk prefetched, the
+  engine stays ahead of playback after the first chunk, so the plan stands.
+- **Time to first audio scales with the first chunk's length**, not a fixed
+  overhead. The chunker therefore emits a **short first chunk** (the first
+  clause, up to about 60 chars, giving about 0.6 s to first sound), then
+  normal 220-char chunks.
+- The engine thread synthesizes chunk N+1 while N plays. When idle, the model
+  stays warm (load costs 1 s).
+- Follow-up (not blocking): profile the Kokoro vocoder kernels on Metal
+  (`conv_transpose_1d`, `conv_1d`, iSTFT path in `tools/mtmd/models/kokoro.cpp`).
+  MLX ports of Kokoro run much faster on the same hardware, so a fix there
+  (upstream, ideally) could bring a 5–10× gain.
+
+**Shim notes**
+- `te_load` mirrors what `common_params_parse` does after parsing, including
+  `postprocess_cpu_params()`. Without it, `n_threads = -1` produces a garbage
+  allocation (about 17 PB) at the first decode.
+- Synthesis follows the server's order: `reset → set_input → step_prompt… →
+  step_gen… → flush → get_output`, in PCM mode. One engine is reused across
+  calls.
 
 **Phase 1: core and CLI**
 - Engine thread, md4c markdown, chunker, AudioQueue player with one-chunk

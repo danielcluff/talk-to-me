@@ -1,0 +1,13 @@
+.{
+    .name = .talk_to_me,
+    .version = "0.0.0",
+    .fingerprint = 0x41618750c8e1ada4,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "engine",
+    },
+}

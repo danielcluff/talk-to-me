@@ -4,18 +4,21 @@ Local text-to-speech for macOS on Apple Silicon. Agents, the browser, Finder
 and the command line send text to one queue, and it's read aloud with Kokoro
 running in-process on Metal through llama.cpp. Nothing leaves the machine.
 
-Status: Phase 1 (core server and CLI). The menu bar app is Phase 2. See
-[docs/PLAN.md](docs/PLAN.md).
+Status: Phase 2 (menu bar app, Settings with Models and Voices). Phase 3
+(Services, hotkeys) is next. See [docs/PLAN.md](docs/PLAN.md).
 
 ## Build
 
-Requirements: Apple Silicon, macOS 14+, Zig 0.17.0, CMake, Ninja, Xcode Command
-Line Tools.
+Requirements: Apple Silicon, macOS 14+, Zig 0.17.0, CMake, Ninja, Xcode 26.3
+(the last release for Sequoia) with the Metal toolchain
+(`xcodebuild -downloadComponent MetalToolchain`).
 
 ```sh
 git submodule update --init
 zig build --release        # builds llama.cpp (first time: a few minutes) and zig-out/bin/talktome
 zig build test             # unit tests (markdown, chunker)
+zig build app --release    # zig-out/TalkToMe.app (menu bar app)
+open zig-out/TalkToMe.app
 ```
 
 ## Use
@@ -35,8 +38,8 @@ it isn't running. Its log goes to `~/Library/Logs/TalkToMe/server.log`. Data
 lives in `~/Library/Application Support/TalkToMe` (settings, API token,
 models).
 
-The first model load after a fresh build takes 12 to 14 s while Metal compiles
-its shaders. Later loads take under a second.
+When the app is installed, the CLI launches it and talks to its server instead
+of starting its own.
 
 ## API
 

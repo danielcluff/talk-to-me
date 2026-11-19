@@ -52,6 +52,18 @@ pub const Paths = struct {
         };
     }
 
+    /// Paths for a given HOME (the app and libtalk, which have no Environ.Map).
+    pub fn initHome(arena: std.mem.Allocator, home: []const u8) !Paths {
+        const root = try std.fs.path.join(arena, &.{ home, "Library", "Application Support", "TalkToMe" });
+        return .{
+            .root = root,
+            .settings = try std.fs.path.join(arena, &.{ root, "settings.json" }),
+            .token = try std.fs.path.join(arena, &.{ root, "token" }),
+            .models = try std.fs.path.join(arena, &.{ root, "models" }),
+            .logs = try std.fs.path.join(arena, &.{ home, "Library", "Logs", "TalkToMe" }),
+        };
+    }
+
     pub fn modelDir(p: Paths, arena: std.mem.Allocator, id: []const u8) ![]const u8 {
         return std.fs.path.join(arena, &.{ p.models, id });
     }

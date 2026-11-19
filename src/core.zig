@@ -453,9 +453,10 @@ pub const Core = struct {
         j.created_ms = self.nowMs();
 
         self.mu.lock();
-        // dedupe: same source and text within the window
+        // dedupe: same source and text within the window. Only for agent-style
+        // policies; something you start yourself (interrupt) always plays.
         const window: i64 = @as(i64, self.settings.dedupe_seconds) * 1000;
-        if (window > 0) {
+        if (window > 0 and req.policy != .interrupt) {
             const dup = for (self.pending.items) |p| {
                 if (p.hash == j.hash and j.created_ms - p.created_ms < window) break true;
             } else if (self.current) |cur| cur.hash == j.hash and j.created_ms - cur.created_ms < window else false;

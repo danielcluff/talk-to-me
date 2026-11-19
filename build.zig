@@ -86,9 +86,44 @@ pub fn build(b: *std.Build) void {
     main_mod.addImport("c", c_mod);
     const talktome_bin = appleLink(b, "talktome", main_mod, engine_lib, &cmake_build.step);
     b.getInstallStep().dependOn(&b.addInstallBinFile(talktome_bin, "talktome").step);
+    // precompiled Metal shaders, found next to the binary (the app ships them in Resources)
+    for ([_][]const u8{ "default.metallib", "ggml-tensor.metallib" }) |lib| {
+        const inst = b.addInstallBinFile(b.path(b.fmt("{s}/bin/{s}", .{ engine_build_dir, lib })), lib);
+        inst.step.dependOn(&cmake_build.step);
+        b.getInstallStep().dependOn(&inst.step);
+    }
     const run_talktome = b.addRunFile(talktome_bin);
     run_talktome.addPassthruArgs();
     b.step("run", "Run talktome").dependOn(&run_talktome.step);
+
+    // libtalk.a: the core as a C library for the macOS app (include/talk.h).
+    const lib_mod = b.createModule(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    lib_mod.addImport("c", c_mod);
+    const libtalk = b.addLibrary(.{ .name = "talk", .linkage = .static, .root_module = lib_mod });
+    libtalk.bundle_compiler_rt = true;
+    libtalk.step.dependOn(&cmake_build.step);
+    const lib_step = b.step("lib", "Build libtalk.a, talk.h and the engine archive into zig-out/lib");
+    const lib_files = [_]*std.Build.Step{
+        &b.addInstallArtifact(libtalk, .{}).step,
+        &b.addInstallFile(b.path("include/talk.h"), "include/talk.h").step,
+        &b.addInstallLibFile(b.path(engine_lib), "libtalk_engine_all.a").step,
+    };
+    for (lib_files) |st| {
+        st.dependOn(&cmake_build.step);
+        lib_step.dependOn(st);
+        b.getInstallStep().dependOn(st);
+    }
+
+    // TalkToMe.app: SwiftPM build + bundle assembly (macos/build-app.sh).
+    const app = b.addSystemCommand(&.{"macos/build-app.sh"});
+    app.has_side_effects = true;
+    app.step.dependOn(b.getInstallStep());
+    b.step("app", "Build zig-out/TalkToMe.app").dependOn(&app.step);
 
     const run_spike = b.addRunFile(spike_bin);
     run_spike.addPassthruArgs();

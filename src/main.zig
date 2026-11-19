@@ -147,7 +147,8 @@ fn serve(ctx: *Ctx, settings: config.Settings, rest: []const []const u8) !void {
     const token = try config.loadOrCreateToken(ctx.arena, ctx.io, ctx.paths);
     const core = try Core.create(ctx.gpa, ctx.io, ctx.paths, settings);
     defer core.destroy();
-    var srv: server.Server = .{ .gpa = ctx.gpa, .io = ctx.io, .core = core, .token = token, .port = port, .paths = ctx.paths };
+    if (server.portInUse(ctx.io, port)) return fail(ctx, "a server is already running on port {d}", .{port});
+    var srv: server.Server = .{ .gpa = ctx.gpa, .io = ctx.io, .core = core, .token = token, .port = port, .paths = ctx.paths, .allow_shutdown = true };
     try server.run(&srv);
 }
 
@@ -195,9 +196,28 @@ fn healthy(ctx: *Ctx) bool {
     return res.status == .ok;
 }
 
+/// Launch the menu bar app in the background if it is installed
+/// (LaunchServices knows its bundle id). Returns false if there is no app.
+fn openApp(ctx: *Ctx) bool {
+    if (ctx.environ.get("TALKTOME_HOME") != null) return false; // tests use a standalone server
+    var child = std.process.spawn(ctx.io, .{
+        .argv = &.{ "/usr/bin/open", "-g", "-b", "dev.talktome.app" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return false;
+    const term = child.wait(ctx.io) catch return false;
+    return term.success();
+}
+
 /// Make sure a server is running (start one in the background if not) and
 /// load the token.
 fn ensureServer(ctx: *Ctx) !void {
+    if (!healthy(ctx) and openApp(ctx)) {
+        // the app hosts the server; give it a moment to come up
+        var waited: u32 = 0;
+        while (!healthy(ctx) and waited < 10_000) : (waited += 100) try ctx.io.sleep(.fromMilliseconds(100), .awake);
+    }
     if (!healthy(ctx)) {
         const exe = try std.process.executablePathAlloc(ctx.io, ctx.arena);
         try Io.Dir.cwd().createDirPath(ctx.io, ctx.paths.logs);

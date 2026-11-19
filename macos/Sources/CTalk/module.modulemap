@@ -1,0 +1,4 @@
+module CTalk {
+    header "../../../include/talk.h"
+    export *
+}

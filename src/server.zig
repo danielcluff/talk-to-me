@@ -23,12 +23,35 @@ pub const Server = struct {
     token: []const u8,
     port: u16,
     paths: config.Paths,
+    /// `talktome serve` exits on POST /v1/shutdown so the app can take over
+    /// the port; the app's in-process server ignores it.
+    allow_shutdown: bool = false,
 };
 
-pub fn run(s: *Server) !void {
+/// True if something accepts connections on the port.
+pub fn portInUse(io: Io, port: u16) bool {
+    const address = Io.net.IpAddress.parse("127.0.0.1", port) catch return false;
+    const stream = address.connect(io, .{ .mode = .stream }) catch return false;
+    stream.close(io);
+    return true;
+}
+
+/// Bind the API port. Callers check portInUse() first: reuse_address sets
+/// SO_REUSEPORT too, which would let two live servers share the port, but it
+/// is needed to rebind right after a previous server exits (TIME_WAIT).
+pub fn listen(s: *Server) !Io.net.Server {
+    if (portInUse(s.io, s.port)) return error.AddressInUse;
     const address = try Io.net.IpAddress.parse("127.0.0.1", s.port);
-    var listener = try address.listen(s.io, .{ .reuse_address = true });
+    return address.listen(s.io, .{ .reuse_address = true });
+}
+
+pub fn run(s: *Server) !void {
+    var listener = try listen(s);
     defer listener.deinit(s.io);
+    serveOn(s, &listener);
+}
+
+pub fn serveOn(s: *Server, listener: *Io.net.Server) void {
     log.info("listening on http://127.0.0.1:{d}", .{s.port});
     while (true) {
         const stream = listener.accept(s.io) catch |err| {
@@ -101,16 +124,31 @@ fn tokenOk(s: *Server, auth: []const u8) bool {
     return diff == 0;
 }
 
-fn sendJson(req: *http.Server.Request, a: std.mem.Allocator, status: http.Status, value: anytype) !void {
-    const body = try std.json.Stringify.valueAlloc(a, value, .{ .emit_null_optional_fields = false });
-    try req.respond(body, .{
-        .status = status,
-        .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
-    });
+/// One API call, transport-independent: the request body in, status and JSON
+/// out. The HTTP server and the in-process C interface (lib.zig) both use it.
+pub const Exchange = struct {
+    body: []const u8 = "",
+    status: http.Status = .ok,
+    reply: []const u8 = "{}",
+
+    fn bodyLimited(ex: *Exchange, limit: usize) ![]const u8 {
+        if (ex.body.len > limit) return error.BodyTooLarge;
+        return ex.body;
+    }
+};
+
+fn sendJson(ex: *Exchange, a: std.mem.Allocator, status: http.Status, value: anytype) !void {
+    ex.status = status;
+    ex.reply = try std.json.Stringify.valueAlloc(a, value, .{ .emit_null_optional_fields = false });
 }
 
-fn sendError(req: *http.Server.Request, a: std.mem.Allocator, status: http.Status, msg: []const u8) !void {
-    try sendJson(req, a, status, .{ .@"error" = msg });
+fn sendError(ex: *Exchange, a: std.mem.Allocator, status: http.Status, msg: []const u8) !void {
+    try sendJson(ex, a, status, .{ .@"error" = msg });
+}
+
+fn respondError(req: *http.Server.Request, a: std.mem.Allocator, status: http.Status, msg: []const u8) !void {
+    const body = try std.json.Stringify.valueAlloc(a, .{ .@"error" = msg }, .{});
+    try req.respond(body, .{ .status = status, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
 }
 
 fn readBody(req: *http.Server.Request, a: std.mem.Allocator, limit: usize) ![]u8 {
@@ -128,15 +166,42 @@ fn handle(s: *Server, req: *http.Server.Request, a: std.mem.Allocator) !void {
     const head = try readHead(a, req);
     const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
 
-    if (!hostAllowed(s, head.host)) return sendError(req, a, .forbidden, "bad host");
-    if (head.origin != null) return sendError(req, a, .forbidden, "browser origins are not allowed yet");
+    if (!hostAllowed(s, head.host)) return respondError(req, a, .forbidden, "bad host");
+    if (head.origin != null) return respondError(req, a, .forbidden, "browser origins are not allowed yet");
+    const public = method == .GET and std.mem.eql(u8, path, "/v1/health");
+    if (!public and !tokenOk(s, head.auth)) return respondError(req, a, .unauthorized, "missing or bad token");
+    if (method == .GET and std.mem.eql(u8, path, "/v1/events")) return events(s, req, a);
 
+    var ex: Exchange = .{};
+    if (method.requestHasBody()) {
+        ex.body = readBody(req, a, 4 << 20) catch return respondError(req, a, .payload_too_large, "body too large");
+    }
+    try dispatch(s, &ex, a, method, path);
+    try req.respond(ex.reply, .{
+        .status = ex.status,
+        .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+    });
+}
+
+/// Route one authenticated API call (everything except /v1/events and the
+/// transport checks).
+pub fn dispatch(s: *Server, ex: *Exchange, a: std.mem.Allocator, method: http.Method, path: []const u8) !void {
+    const req = ex;
     if (method == .GET and std.mem.eql(u8, path, "/v1/health")) {
         const p = try s.core.playerSnapshot(a);
         return sendJson(req, a, .ok, .{ .ok = true, .version = version, .model = p.model, .model_state = p.model_state, .queued = p.queued, .state = p.state });
     }
-    if (!tokenOk(s, head.auth)) return sendError(req, a, .unauthorized, "missing or bad token");
-
+    if (method == .POST and std.mem.eql(u8, path, "/v1/shutdown")) {
+        if (!s.allow_shutdown) return sendError(req, a, .forbidden, "this server is hosted by the app");
+        const t = try std.Thread.spawn(.{}, struct {
+            fn run(io: Io) void {
+                io.sleep(.fromMilliseconds(200), .awake) catch {};
+                std.process.exit(0);
+            }
+        }.run, .{s.io});
+        t.detach();
+        return sendJson(req, a, .ok, .{ .ok = true });
+    }
     if (method == .POST and std.mem.eql(u8, path, "/v1/speak")) return speak(s, req, a);
     if (method == .POST and std.mem.eql(u8, path, "/v1/speak/file")) return speakFile(s, req, a);
     if (method == .GET and std.mem.eql(u8, path, "/v1/jobs")) return sendJson(req, a, .ok, .{ .jobs = try s.core.jobViews(a) });
@@ -152,7 +217,6 @@ fn handle(s: *Server, req: *http.Server.Request, a: std.mem.Allocator) !void {
         s.core.command(cmd);
         return sendJson(req, a, .ok, try s.core.playerSnapshot(a));
     }
-    if (method == .GET and std.mem.eql(u8, path, "/v1/events")) return events(s, req, a);
     if (method == .GET and std.mem.eql(u8, path, "/v1/models")) return sendJson(req, a, .ok, .{ .models = try s.core.modelViews(a) });
     if (std.mem.startsWith(u8, path, "/v1/models/")) return modelRoute(s, req, a, method, path["/v1/models/".len..]);
     if (method == .GET and std.mem.eql(u8, path, "/v1/voices")) {
@@ -187,15 +251,15 @@ const SpeakBody = struct {
     policy: core_mod.Policy = .queue,
 };
 
-fn respondSpeak(req: *http.Server.Request, a: std.mem.Allocator, result: core_mod.SpeakResult) !void {
+fn respondSpeak(req: *Exchange, a: std.mem.Allocator, result: core_mod.SpeakResult) !void {
     switch (result) {
         .queued => |q| try sendJson(req, a, .accepted, .{ .job_id = try jobIdStr(a, q.id), .chunks = q.chunks, .position = q.position }),
         .dropped => |reason| try sendJson(req, a, .ok, .{ .dropped = reason }),
     }
 }
 
-fn speak(s: *Server, req: *http.Server.Request, a: std.mem.Allocator) !void {
-    const body = readBody(req, a, 4 << 20) catch return sendError(req, a, .payload_too_large, "body too large");
+fn speak(s: *Server, req: *Exchange, a: std.mem.Allocator) !void {
+    const body = req.bodyLimited(4 << 20) catch return sendError(req, a, .payload_too_large, "body too large");
     const parsed = std.json.parseFromSliceLeaky(SpeakBody, a, body, .{ .ignore_unknown_fields = true }) catch
         return sendError(req, a, .bad_request, "invalid JSON body");
     if (parsed.text == null and parsed.chunks == null) return sendError(req, a, .bad_request, "text or chunks required");
@@ -229,8 +293,8 @@ pub fn formatForPath(path: []const u8) ?core_mod.Format {
     return null;
 }
 
-fn speakFile(s: *Server, req: *http.Server.Request, a: std.mem.Allocator) !void {
-    const body = readBody(req, a, 64 << 10) catch return sendError(req, a, .payload_too_large, "body too large");
+fn speakFile(s: *Server, req: *Exchange, a: std.mem.Allocator) !void {
+    const body = req.bodyLimited(64 << 10) catch return sendError(req, a, .payload_too_large, "body too large");
     const parsed = std.json.parseFromSliceLeaky(FileBody, a, body, .{ .ignore_unknown_fields = true }) catch
         return sendError(req, a, .bad_request, "invalid JSON body");
     if (!std.fs.path.isAbsolute(parsed.path)) return sendError(req, a, .bad_request, "path must be absolute");
@@ -253,7 +317,7 @@ fn speakFile(s: *Server, req: *http.Server.Request, a: std.mem.Allocator) !void 
     return respondSpeak(req, a, result);
 }
 
-fn modelRoute(s: *Server, req: *http.Server.Request, a: std.mem.Allocator, method: http.Method, rest: []const u8) !void {
+fn modelRoute(s: *Server, req: *Exchange, a: std.mem.Allocator, method: http.Method, rest: []const u8) !void {
     const slash = std.mem.indexOfScalar(u8, rest, '/');
     const id = if (slash) |i| rest[0..i] else rest;
     const action = if (slash) |i| rest[i + 1 ..] else "";
@@ -292,8 +356,8 @@ const SettingsPatch = struct {
     dedupe_seconds: ?u32 = null,
 };
 
-fn patchSettings(s: *Server, req: *http.Server.Request, a: std.mem.Allocator) !void {
-    const body = readBody(req, a, 64 << 10) catch return sendError(req, a, .payload_too_large, "body too large");
+fn patchSettings(s: *Server, req: *Exchange, a: std.mem.Allocator) !void {
+    const body = req.bodyLimited(64 << 10) catch return sendError(req, a, .payload_too_large, "body too large");
     const patch = std.json.parseFromSliceLeaky(SettingsPatch, a, body, .{ .ignore_unknown_fields = false }) catch
         return sendError(req, a, .bad_request, "invalid settings (unknown key or bad value)");
     var settings = try s.core.getSettings(a);
@@ -313,6 +377,19 @@ fn patchSettings(s: *Server, req: *http.Server.Request, a: std.mem.Allocator) !v
     if (patch.dedupe_seconds) |v| settings.dedupe_seconds = v;
     s.core.setSettings(settings) catch |err| return sendError(req, a, .internal_server_error, @errorName(err));
     return sendJson(req, a, .ok, try s.core.getSettings(a));
+}
+
+/// One event as JSON; the same shape for SSE and the C interface.
+pub fn eventJson(a: std.mem.Allocator, e: *const core_mod.Event) ![]const u8 {
+    const job = if (e.job != 0) try jobIdStr(a, e.job) else null;
+    return std.json.Stringify.valueAlloc(a, .{
+        .seq = e.seq,
+        .type = @tagName(e.kind),
+        .job = job,
+        .index = e.index,
+        .count = e.count,
+        .state = e.stateStr(),
+    }, .{ .emit_null_optional_fields = false });
 }
 
 /// Server-sent events: one `data:` JSON line per event, plus a comment ping
@@ -347,15 +424,7 @@ fn events(s: *Server, req: *http.Server.Request, a: std.mem.Allocator) !void {
         }
         for (batch[0..n]) |*e| {
             after = e.seq;
-            const job = if (e.job != 0) try jobIdStr(a, e.job) else null;
-            const json = try std.json.Stringify.valueAlloc(a, .{
-                .seq = e.seq,
-                .type = @tagName(e.kind),
-                .job = job,
-                .index = e.index,
-                .count = e.count,
-                .state = e.stateStr(),
-            }, .{ .emit_null_optional_fields = false });
+            const json = try eventJson(a, e);
             try body.writer.print("event: {s}\ndata: {s}\n\n", .{ @tagName(e.kind), json });
         }
         try body.writer.flush(); // drain into the chunked stream

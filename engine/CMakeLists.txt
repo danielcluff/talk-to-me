@@ -12,7 +12,7 @@ set(CMAKE_OSX_ARCHITECTURES arm64 CACHE STRING "" FORCE)
 
 set(BUILD_SHARED_LIBS        OFF CACHE BOOL "" FORCE)
 set(GGML_METAL               ON  CACHE BOOL "" FORCE)
-set(GGML_METAL_EMBED_LIBRARY ON  CACHE BOOL "" FORCE)
+set(GGML_METAL_EMBED_LIBRARY OFF CACHE BOOL "" FORCE) # precompiled default.metallib, shipped beside the binary / in Resources
 set(LLAMA_BUILD_COMMON       ON  CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_MTMD         ON  CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_TOOLS        OFF CACHE BOOL "" FORCE)
@@ -57,3 +57,5 @@ add_custom_command(
     COMMENT "Bundling libtalk_engine_all.a"
 )
 add_custom_target(talk_engine_all ALL DEPENDS ${TE_ALL})
+# precompiled shaders: .build/engine/bin/default.metallib (+ ggml-tensor.metallib when the SDK supports it)
+add_dependencies(talk_engine_all ggml-metal-lib)

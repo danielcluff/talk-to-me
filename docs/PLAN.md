@@ -580,7 +580,7 @@ Known limitations, to fix later:
 - `/mcp` and `/v1/audio/speech` aren't built yet (Phase 4).
 
 **Phase 2: Mac shell**
-- Xcode project linking `libtalk.a`, the menu bar menu, and the settings
+- App linking `libtalk.a`, the menu bar menu, and the settings
   window (General, Models, Voices) with first-run onboarding.
 - Requires full Xcode (for `xcodebuild` and the `metal` compiler). The dev Mac
   stays on macOS Sequoia, so use **Xcode 26.3**, the last release that runs on
@@ -591,6 +591,50 @@ Known limitations, to fix later:
   first launch skips the 12–14 s shader compile.
 - *Done when:* starting from a fresh install, you can download Kokoro, preview
   voices and pick one, all from the UI.
+
+**Phase 2 results (2026-11-19)**
+
+Built:
+- `src/lib.zig` and `include/talk.h`: `libtalk.a` with `talk_start`,
+  `talk_call` and `talk_free`.
+- `macos/`: a SwiftPM menu bar app, assembled into `zig-out/TalkToMe.app` by
+  `zig build app`.
+
+Decisions:
+- **SwiftPM instead of an `.xcodeproj`.** There's no project file to maintain,
+  and Xcode can still open `macos/Package.swift`. `build-app.sh` assembles the
+  bundle (Info.plist with `LSUIElement`, metallibs and the `talktome` CLI in
+  Resources) and signs it ad hoc.
+- **A one-function C interface.** `talk_call(method, path, body)` routes through
+  the same `dispatch()` as the HTTP server (`server.zig`, `Exchange`), so the
+  app, the CLI and hooks share one code path. Events reach Swift through a
+  callback with the same JSON as SSE.
+- **The app hosts the HTTP API too**, so the CLI and hooks keep working.
+  - On launch, the app probes the port. If a standalone `talktome serve` holds
+    it, the app asks it to exit (`POST /v1/shutdown`, which only standalone
+    servers honor) and takes over.
+  - The CLI now runs `open -g -b dev.talktome.app` before falling back to
+    starting `talktome serve`.
+- **Precompiled shaders.** `GGML_METAL_EMBED_LIBRARY=OFF`, so CMake builds
+  `default.metallib` and `ggml-tensor.metallib`, installed next to the binaries
+  and in the app's Resources. The first load after a fresh build takes 0.94 s
+  instead of 14 s, and binaries shrank from 17.5 MB to 12 MB.
+- **The Settings window is a plain `NSWindow`** around SwiftUI, so a menu bar
+  app can open and focus it, including on first launch.
+- **The duplicate filter applies to agent-style policies only.** A voice
+  preview or anything else you start yourself always plays.
+
+Verified:
+- On the real home folder: the app serves the API, the CLI talks to it, and
+  speech plays.
+- With an empty home folder: on first launch the app opens Settings (the window
+  exists on screen at 860×600, and the menu bar item is present). Then, through
+  the same routes the UI calls: tiny-voca downloads, activates, lists its
+  voices and speaks.
+
+Not verified: the look of the UI and clicking through it. This session can't
+capture the screen (no Screen Recording permission), so that needs a manual
+check.
 
 **Phase 3: system inputs**
 - Services for text and files, Open With, global hotkeys (AX selection grab,

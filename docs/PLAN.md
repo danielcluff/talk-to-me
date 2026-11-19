@@ -642,6 +642,48 @@ check.
 - *Done when:* right-clicking selected text or a `.md` reads it, and ⌥⇧R works
   in Safari, Notes and Finder.
 
+**Phase 3 results (2026-11-19)**
+
+Built:
+- **Global hotkeys** with `KeyboardShortcuts` 3.1.0 (pinned): ⌥⇧R read
+  selection, ⌥⇧P pause/resume, ⌥⇧X stop, plus optional skip and
+  read-clipboard keys. They're shown in the menu next to their items and
+  rebindable on the new Shortcuts page.
+- **Read Selection.** With Finder in front, it reads the selected `.md` and
+  `.txt` files through AppleScript (Automation). The first file interrupts and
+  the rest queue. In any other app, it reads `AXSelectedText` (Accessibility),
+  falling back to a synthetic ⌘C with the clipboard saved and restored.
+- **Services:** "Read Aloud with Talk to Me" for text and "Read File with Talk
+  to Me" for Markdown and text files. They're on by default through an empty
+  `NSRequiredContext`.
+- **Open With:** Talk to Me is an Alternate viewer for Markdown and plain text,
+  and opened files are read.
+- **Permissions page:** live status for Accessibility and Finder Automation,
+  with Grant buttons.
+
+Verified:
+- Both Services, through `NSPerformService`: text spoke, a `.md` file was
+  read and interrupted the text as designed.
+- Open With: `open -a TalkToMe.app README.md` read the file.
+- Both Services are registered with `pbs`.
+
+Fixed while testing:
+- A Phase 2 regression: the HTTP server read a body for every POST, and
+  `std.http.Client` declares a chunked body on a bodiless POST without sending
+  it, so `talktome pause`, `stop` and friends hung.
+- The server now reads only declared bodies, and the CLI always sends `{}`
+  with a POST.
+
+Needs a person to test:
+- The hotkeys and the selection grab in Safari, Notes and Finder. They need
+  real keypresses and an Accessibility grant to the app.
+- A dev build is signed ad hoc, so its code hash changes every rebuild and
+  macOS may ask for Accessibility again. A stable signing identity (Phase 6)
+  fixes that.
+
+Not done: a drop target on the menu bar icon (low value; Open With covers
+dragging files onto the app in Finder).
+
 **Phase 4: agents**
 - `talktome hook claude|codex|opencode`, the Claude Code plugin, the Codex notify
   chain, the OpenCode plugin, the herdr mod, the MCP endpoint, dedupe, and the

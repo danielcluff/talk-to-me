@@ -8,11 +8,15 @@ let zigOut = Context.packageDirectory + "/../zig-out/lib"
 let package = Package(
     name: "TalkToMe",
     platforms: [.macOS(.v14)],
+    dependencies: [
+        // global hotkeys + recorder UI (the package VoiceInk uses)
+        .package(url: "https://github.com/sindresorhus/KeyboardShortcuts", exact: "3.1.0"),
+    ],
     targets: [
         .systemLibrary(name: "CTalk", path: "Sources/CTalk"),
         .executableTarget(
             name: "TalkToMe",
-            dependencies: ["CTalk"],
+            dependencies: ["CTalk", .product(name: "KeyboardShortcuts", package: "KeyboardShortcuts")],
             path: "Sources/TalkToMe",
             linkerSettings: [
                 .unsafeFlags(["-L", zigOut]),

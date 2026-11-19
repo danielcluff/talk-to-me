@@ -162,13 +162,16 @@ fn rawRequest(ctx: *Ctx, method: std.http.Method, path: []const u8, payload: ?[]
     var body: Io.Writer.Allocating = .init(ctx.arena);
     const url = try std.fmt.allocPrint(ctx.arena, "http://127.0.0.1:{d}{s}", .{ ctx.port, path });
     const auth = try std.fmt.allocPrint(ctx.arena, "Bearer {s}", .{ctx.token});
+    // std.http.Client declares a chunked body on a bodiless POST and never
+    // sends it, so the server would wait; always send at least "{}".
+    const body_payload: ?[]const u8 = payload orelse if (method.requestHasBody()) @as([]const u8, "{}") else null;
     const res = try client.fetch(.{
         .location = .{ .url = url },
         .method = method,
-        .payload = payload,
+        .payload = body_payload,
         .keep_alive = false,
         .response_writer = &body.writer,
-        .headers = .{ .content_type = if (payload != null) .{ .override = "application/json" } else .default },
+        .headers = .{ .content_type = if (body_payload != null) .{ .override = "application/json" } else .default },
         .extra_headers = &.{.{ .name = "authorization", .value = auth }},
     });
     return .{ .status = res.status, .body = body.written() };

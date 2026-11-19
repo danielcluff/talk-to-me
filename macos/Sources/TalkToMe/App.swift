@@ -1,4 +1,5 @@
 import AppKit
+import KeyboardShortcuts
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -35,8 +36,13 @@ enum MenuBarIcon {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private let services = ServiceProvider()
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.servicesProvider = services
+        NSUpdateDynamicServices()
         Task { @MainActor in
+            Hotkeys.install()
             let core = TalkCore.shared
             core.start()
             await core.refreshAll()
@@ -45,6 +51,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 SettingsWindow.shared.show(.models)
             }
         }
+    }
+
+    /// Open With → Talk to Me, or files dropped on the app.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        Task { @MainActor in Inputs.readFiles(urls) }
     }
 }
 
@@ -63,23 +74,21 @@ struct MenuContent: View {
         }
         Divider()
 
-        if core.player.state == "paused" {
-            Button("Resume") { core.command("resume") }
-        } else {
-            Button("Pause") { core.command("pause") }
-                .disabled(core.player.state == "idle")
-        }
+        Button(core.player.state == "paused" ? "Resume" : "Pause") { core.command("toggle") }
+            .globalKeyboardShortcut(.togglePause)
+            .disabled(core.player.state == "idle")
         Button("Stop") { core.command("stop") }
+            .globalKeyboardShortcut(.stopSpeaking)
             .disabled(core.player.state == "idle" && core.player.queued == 0)
         Button("Skip to Next Item") { core.command("skip") }
+            .globalKeyboardShortcut(.skipItem)
             .disabled(core.player.state == "idle")
         Divider()
 
-        Button("Read Clipboard") {
-            if let text = NSPasteboard.general.string(forType: .string), !text.isEmpty {
-                core.speak(text, app: "clipboard")
-            }
-        }
+        Button("Read Selection") { Inputs.readSelection() }
+            .globalKeyboardShortcut(.readSelection)
+        Button("Read Clipboard") { Inputs.readClipboard() }
+            .globalKeyboardShortcut(.readClipboard)
         Button("Open File…") { openFile() }
         Divider()
 
@@ -140,6 +149,8 @@ func appName(_ app: String) -> String {
     case "cli": return "Terminal"
     case "file": return "File"
     case "menu", "clipboard": return "Clipboard"
+    case "selection": return "Selection"
+    case "service": return "Services"
     case "preview": return "Preview"
     default: return app
     }

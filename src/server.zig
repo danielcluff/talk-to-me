@@ -173,7 +173,10 @@ fn handle(s: *Server, req: *http.Server.Request, a: std.mem.Allocator) !void {
     if (method == .GET and std.mem.eql(u8, path, "/v1/events")) return events(s, req, a);
 
     var ex: Exchange = .{};
-    if (method.requestHasBody()) {
+    // only read a body the request declares (Content-Length or chunked); a
+    // bare POST like /v1/player/stop would otherwise wait for EOF forever
+    const declared = req.head.content_length != null or req.head.transfer_encoding == .chunked;
+    if (method.requestHasBody() and declared) {
         ex.body = readBody(req, a, 4 << 20) catch return respondError(req, a, .payload_too_large, "body too large");
     }
     try dispatch(s, &ex, a, method, path);

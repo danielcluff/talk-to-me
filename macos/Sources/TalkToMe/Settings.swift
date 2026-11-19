@@ -1,9 +1,10 @@
 import AppKit
+import KeyboardShortcuts
 import ServiceManagement
 import SwiftUI
 
 enum SettingsPage: String, CaseIterable, Identifiable {
-    case general, models, voices, about
+    case general, models, voices, shortcuts, permissions, about
     var id: String { rawValue }
 
     var title: String {
@@ -11,6 +12,8 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .general: "General"
         case .models: "Models"
         case .voices: "Voices"
+        case .shortcuts: "Shortcuts"
+        case .permissions: "Permissions"
         case .about: "About"
         }
     }
@@ -20,6 +23,8 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .general: "gearshape"
         case .models: "cpu"
         case .voices: "person.wave.2"
+        case .shortcuts: "keyboard"
+        case .permissions: "lock.shield"
         case .about: "info.circle"
         }
     }
@@ -81,6 +86,8 @@ struct SettingsView: View {
                     case .general: GeneralPage()
                     case .models: ModelsPage()
                     case .voices: VoicesPage()
+                    case .shortcuts: ShortcutsPage()
+                    case .permissions: PermissionsPage()
                     case .about: AboutPage()
                     }
                 }
@@ -356,6 +363,96 @@ struct VoicesPage: View {
         .contentShape(Rectangle())
         .onTapGesture { core.update(["voice": v.name]) }
         .help(v.default ? "Default voice" : "Click to make this the default")
+    }
+}
+
+// MARK: - Shortcuts
+
+struct ShortcutsPage: View {
+    var body: some View {
+        PageHeader(title: "Shortcuts", subtitle: "Global hotkeys work in every app. Click a shortcut to change it; press Delete to clear it.")
+        Card {
+            row("Read selection", .readSelection,
+                "Selected text in any app, or the selected .md and .txt files in Finder.")
+            Divider()
+            row("Pause / resume", .togglePause, nil)
+            Divider()
+            row("Stop and clear the queue", .stopSpeaking, nil)
+            Divider()
+            row("Skip to the next item", .skipItem, nil)
+            Divider()
+            row("Read clipboard", .readClipboard, nil)
+        }
+        Text("Read selection needs Accessibility permission, and Finder files need Automation permission. See Permissions.")
+            .font(.callout).foregroundStyle(.secondary)
+    }
+
+    private func row(_ title: String, _ name: KeyboardShortcuts.Name, _ detail: String?) -> some View {
+        HStack(alignment: .center) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                if let detail { Text(detail).font(.callout).foregroundStyle(.secondary) }
+            }
+            Spacer()
+            KeyboardShortcuts.Recorder(for: name)
+        }
+    }
+}
+
+// MARK: - Permissions
+
+struct PermissionsPage: View {
+    @State private var accessibility = Permissions.accessibilityGranted()
+    @State private var finder = Permissions.finderAutomation(ask: false)
+    private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        PageHeader(title: "Permissions", subtitle: "Only needed for the Read Selection hotkey.")
+        Card {
+            permissionRow(
+                title: "Accessibility",
+                detail: "Reads the selected text in other apps, or copies it with ⌘C when an app doesn't share it.",
+                granted: accessibility,
+                action: {
+                    _ = Permissions.accessibilityGranted(prompt: true)
+                    Permissions.openSystemSettings("Privacy_Accessibility")
+                })
+            Divider()
+            permissionRow(
+                title: "Automation: Finder",
+                detail: finder == .finderNotRunning ? "Finder isn't running." : "Reads which files are selected in Finder.",
+                granted: finder == .granted,
+                action: {
+                    if Permissions.finderAutomation(ask: true) != .granted {
+                        Permissions.openSystemSettings("Privacy_Automation")
+                    }
+                    finder = Permissions.finderAutomation(ask: false)
+                })
+        }
+        Text("A development build is signed ad hoc, so macOS may ask again after each rebuild. Signed releases keep the permission.")
+            .font(.callout).foregroundStyle(.secondary)
+            .onReceive(timer) { _ in
+                accessibility = Permissions.accessibilityGranted()
+                finder = Permissions.finderAutomation(ask: false)
+            }
+    }
+
+    private func permissionRow(title: String, detail: String, granted: Bool, action: @escaping () -> Void) -> some View {
+        HStack {
+            Image(systemName: granted ? "checkmark.circle.fill" : "exclamationmark.circle")
+                .foregroundStyle(granted ? .green : .orange)
+                .font(.title2)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.headline)
+                Text(detail).font(.callout).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if granted {
+                Text("Granted").foregroundStyle(.secondary)
+            } else {
+                Button("Grant…", action: action)
+            }
+        }
     }
 }
 

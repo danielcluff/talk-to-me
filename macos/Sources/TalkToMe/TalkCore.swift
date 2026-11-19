@@ -208,14 +208,14 @@ final class TalkCore: ObservableObject {
 
     func command(_ cmd: String) { Task { await send("POST", "/v1/player/\(cmd)"); await refreshPlayer() } }
 
-    func speak(_ text: String, voice: String? = nil, app: String = "menu", policy: String = "interrupt") {
-        var body: [String: Any] = ["text": text, "policy": policy, "source": ["app": app]]
+    func speak(_ text: String, voice: String? = nil, app: String = "menu", label: String = "", policy: String = "interrupt") {
+        var body: [String: Any] = ["text": text, "policy": policy, "source": ["app": app, "label": label]]
         if let voice { body["voice"] = voice }
         Task { await send("POST", "/v1/speak", body) }
     }
 
-    func speakFile(_ url: URL) {
-        Task { await send("POST", "/v1/speak/file", ["path": url.path, "policy": "interrupt", "source": ["app": "file", "label": url.lastPathComponent]]) }
+    func speakFile(_ url: URL, policy: String = "interrupt") {
+        Task { await send("POST", "/v1/speak/file", ["path": url.path, "policy": policy, "source": ["app": "file", "label": url.lastPathComponent]]) }
     }
 
     func removeJob(_ id: Int) { Task { await send("DELETE", "/v1/jobs/\(id)"); await refreshJobs() } }

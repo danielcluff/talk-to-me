@@ -16,6 +16,9 @@ cp "$BIN/TalkToMe" "$APP/Contents/MacOS/TalkToMe"
 cp "$ROOT/macos/Resources/Info.plist" "$APP/Contents/Info.plist"
 # precompiled Metal shaders: ggml finds them through the main bundle
 cp "$OUT/bin/default.metallib" "$OUT/bin/ggml-tensor.metallib" "$APP/Contents/Resources/"
+# SwiftPM resource bundles (KeyboardShortcuts localizations); Bundle.module
+# looks for them in Contents/Resources
+for b in "$BIN"/*.bundle; do [ -e "$b" ] && cp -R "$b" "$APP/Contents/Resources/"; done
 # the CLI ships inside the app; Settings → General links it into ~/.local/bin
 cp "$OUT/bin/talktome" "$APP/Contents/Resources/talktome"
 

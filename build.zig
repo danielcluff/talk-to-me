@@ -43,10 +43,25 @@ pub fn build(b: *std.Build) void {
     engine_step.dependOn(&cmake_build.step);
 
     const engine_c = b.addTranslateC(.{
-        .root_source_file = b.path("engine/talk_engine.h"),
+        .root_source_file = b.path("engine/c_api.h"),
         .target = target,
         .optimize = optimize,
     });
+    engine_c.addIncludePath(b.path("engine"));
+    engine_c.addIncludePath(b.path("vendor/md4c/src"));
+    const c_mod = engine_c.createModule();
+
+    // Unit tests: pure Zig + md4c (compiled here), no engine archive needed.
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/tests.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    test_mod.addImport("c", c_mod);
+    test_mod.addCSourceFile(.{ .file = b.path("vendor/md4c/src/md4c.c") });
+    const tests = b.addTest(.{ .root_module = test_mod });
+    b.step("test", "Run unit tests").dependOn(&b.addRunArtifact(tests).step);
 
     // Phase 0: engine spike — synthesize text to WAV and report timings.
     const spike_mod = b.createModule(.{
@@ -55,11 +70,25 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    spike_mod.addImport("engine", engine_c.createModule());
+    spike_mod.addImport("c", c_mod);
 
     const spike_bin = appleLink(b, "spike", spike_mod, engine_lib, &cmake_build.step);
     const install_spike = b.addInstallBinFile(spike_bin, "spike");
     b.getInstallStep().dependOn(&install_spike.step);
+
+    // talktome: server + CLI.
+    const main_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    main_mod.addImport("c", c_mod);
+    const talktome_bin = appleLink(b, "talktome", main_mod, engine_lib, &cmake_build.step);
+    b.getInstallStep().dependOn(&b.addInstallBinFile(talktome_bin, "talktome").step);
+    const run_talktome = b.addRunFile(talktome_bin);
+    run_talktome.addPassthruArgs();
+    b.step("run", "Run talktome").dependOn(&run_talktome.step);
 
     const run_spike = b.addRunFile(spike_bin);
     run_spike.addPassthruArgs();
@@ -86,6 +115,8 @@ fn appleLink(
         "-framework", "Metal",
         "-framework", "MetalKit",
         "-framework", "Accelerate",
+        "-framework", "AudioToolbox",
+        "-framework", "CoreAudio",
         "-o",
     });
     const out = link.addOutputFileArg(name);

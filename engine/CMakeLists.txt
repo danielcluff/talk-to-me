@@ -26,9 +26,17 @@ set(LLAMA_BUILD_IS_DEV       OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../vendor/llama.cpp llama.cpp EXCLUDE_FROM_ALL)
 
-add_library(talk_engine STATIC talk_engine.cpp talk_engine.h)
+set(MD4C_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../vendor/md4c/src)
+
+# talk_engine.cpp: TTS shim (C++). talk_audio.c: AudioQueue output (C).
+# md4c: markdown parser, plain C, used by the Zig text pipeline.
+add_library(talk_engine STATIC
+    talk_engine.cpp talk_engine.h
+    talk_audio.c talk_audio.h
+    ${MD4C_DIR}/md4c.c
+)
 target_link_libraries(talk_engine PRIVATE mtmd llama-common llama)
-target_include_directories(talk_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(talk_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR} ${MD4C_DIR})
 
 # Merge every static library the shim depends on into one archive.
 set(TE_ALL ${CMAKE_CURRENT_BINARY_DIR}/libtalk_engine_all.a)

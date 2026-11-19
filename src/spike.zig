@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const Io = std.Io;
-const c = @import("engine");
+const c = @import("c");
 
 const default_model_dir = "Library/Application Support/TalkToMe/models/kokoro";
 const model_file = "Kokoro-82M-F32.gguf";

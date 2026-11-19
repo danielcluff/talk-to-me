@@ -401,7 +401,7 @@ Settings window opens on Models with Kokoro highlighted and the text
 
 ## 8. Models
 
-The catalog ships inside the app as `catalog/models.json`. Each entry lists the
+The catalog ships inside the binary as `src/models/catalog.json` (`@embedFile`). Each entry lists the
 HF repo, a pinned revision, the files, sha256 hashes, sizes, the pipeline type
 and voice metadata. Files download to
 `~/Library/Application Support/TalkToMe/models/<id>/` from
@@ -519,6 +519,56 @@ Run with `zig build --release spike -- [--voice V] [--speed S] [--cpu] ["text"]`
 - *Done when:* `talktome README.md` reads aloud with stop, pause, resume, next and
   previous, and `talktome models` downloads Kokoro.
 
+**Phase 1 results (done 2026-11-19)**
+
+Built: `src/core.zig` (queue, policies, engine thread, audio pull),
+`src/server.zig` (HTTP API and SSE), `src/main.zig` (`talktome` server and CLI),
+`src/text/` (md4c markdown and chunker, 12 unit tests), `src/models/` (catalog
+and downloader), `src/config.zig`, and `engine/talk_audio.c` (AudioQueue
+output).
+
+What was verified end to end, against an isolated `TALKTOME_HOME`:
+- **Security.** A missing token, a foreign `Host` and any `Origin` are each
+  rejected, and the token file is mode 0600.
+- **Speaking.** Speaking a file (309 sentences from PLAN.md), inline text and
+  piped markdown all work.
+- **Transport.** `pause`, `resume`, `next`, `previous` (restarts the sentence
+  when more than 1.5 s in), `skip` and `stop` (clears the queue) all work.
+- **Policies.** `queue`, `replace` (drops pending jobs from the same session),
+  `interrupt`, `drop_if_busy` and the 30 s dedupe all work.
+- **Event stream.** SSE `/v1/events` delivers `job_*`, `chunk_started`,
+  `model_state` and `player_state` events.
+- **Timing.** First sound comes 1.5 s after a cold request (0.65 s load plus the
+  first chunk) and 0.7 s warm. Queued jobs play back to back with no gap,
+  because the next job's first chunk is prefetched.
+- **Models.** `models download tiny-voca` downloads at the pinned revision and
+  passes the sha256 check. A corrupted `.part` file is detected, deleted and
+  re-downloaded. `models use`, `voices` (28 English Kokoro voices, 2 for
+  tiny-voca) and `config set voice` work.
+- **Auto-start.** The CLI starts `talktome serve` in the background when no
+  server answers (0.36 s).
+
+Decisions and deviations:
+- **Downloads use `/usr/bin/curl`**, which handles resume, retries and the HF
+  CDN redirect. Hashing, progress and state stay in Zig. This avoids betting on
+  Zig 0.17's TLS client for HF's redirect chain.
+- **`/v1/settings` (GET and PATCH)** was added for the CLI. The Swift shell will
+  use the C ABI instead.
+- **CLI defaults.** A file or inline text uses `interrupt` (you asked for it
+  now). Stdin uses `queue` (it's usually a hook or pipe). The client doesn't
+  block by default; `--wait` blocks until the job finishes.
+- **Pause is instant:** `pull()` outputs silence. The engine thread pauses the
+  AudioQueue hardware after 2 s idle and unloads the model after
+  `idle_unload_minutes`.
+- **Interrupt drops the interrupted job.** It doesn't stay resumable yet.
+
+Known limitations, to fix later:
+- **Synthesis can't be preempted.** An interrupt or skip that arrives while the
+  engine is synthesizing a long prefetched sentence waits for it to finish (up
+  to about 3 s for a 220-char chunk). Options: lower `max_len`, or let the shim
+  check a cancel flag between Kokoro segments.
+- `/mcp` and `/v1/audio/speech` aren't built yet (Phase 4).
+
 **Phase 2: Mac shell**
 - Xcode project linking `libtalk.a`, the menu bar menu, and the settings
   window (General, Models, Voices) with first-run onboarding.
@@ -570,7 +620,7 @@ talk-to-me/
     audio/player.zig          (AudioToolbox AudioQueue)
     server/http.zig  server/sse.zig  server/mcp.zig  server/auth.zig
     models/catalog.zig  models/download.zig
-  catalog/models.json
+  src/models/catalog.json     model catalog (embedded)
   macos/                      Xcode project: App, MenuBar, Settings/*, Services, Hotkeys, Permissions
   integrations/
     claude-code/  codex/  opencode/  herdr/  chrome/

@@ -469,8 +469,17 @@ Run with `zig build --release spike -- [--voice V] [--speed S] [--cpu] ["text"]`
 | medium (~20 words) | 116 | 2.68 s | 7.3 s | 2.7× |
 | long | 204 | 4.69 s | 12.7 s | 2.7× |
 
-- Model load: **0.96 s**. First synthesis after load: 0.5–0.85 s. Peak RSS:
-  **430 MB**. The engine reports 54 voices, 24 kHz mono.
+- Model load: **0.5–1.0 s** (warm). First synthesis after load: 0.5–0.85 s.
+  Peak RSS: **430 MB**. The engine reports 54 voices, 24 kHz mono.
+- **The first load after each new build takes 12–14 s.** With
+  `GGML_METAL_EMBED_LIBRARY=ON`, ggml embeds the Metal *source* and compiles it
+  at runtime. macOS caches the result, so later loads are fast again. An
+  installed app would pay this on first launch and after every update. **Fix
+  (Phase 2):** build with `GGML_METAL_EMBED_LIBRARY=OFF` so CMake precompiles
+  `default.metallib` (plus `ggml-tensor.metallib`), and ship them in the app's
+  `Contents/Resources`, where ggml finds them through
+  `NSBundle pathForResource`. This needs the `metal` compiler, which comes with
+  full Xcode, not the Command Line Tools (this machine has only the CLT).
 - Nearly all the time (about 97%) is the vocoder (`GEN_WAV`). The phonemizer
   template and backbone take 10–80 ms.
 - CPU-only is 1.9× faster than real time (613 MB RSS), so Metal is only about
@@ -513,6 +522,9 @@ Run with `zig build --release spike -- [--voice V] [--speed S] [--cpu] ["text"]`
 **Phase 2: Mac shell**
 - Xcode project linking `libtalk.a`, the menu bar menu, and the settings
   window (General, Models, Voices) with first-run onboarding.
+- Requires full Xcode (for `xcodebuild` and the `metal` compiler). Switch the
+  engine to a precompiled `default.metallib` in `Contents/Resources` so the
+  first launch skips the 12–14 s shader compile.
 - *Done when:* starting from a fresh install, you can download Kokoro, preview
   voices and pick one, all from the UI.
 

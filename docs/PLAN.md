@@ -674,9 +674,9 @@ Fixed while testing:
 - The server now reads only declared bodies, and the CLI always sends `{}`
   with a POST.
 
-Needs a person to test:
-- The hotkeys and the selection grab in Safari, Notes and Finder. They need
-  real keypresses and an Accessibility grant to the app.
+Confirmed by hand (2026-11-19): the global hotkeys work.
+
+Note:
 - A dev build is signed ad hoc, so its code hash changes every rebuild and
   macOS may ask for Accessibility again. A stable signing identity (Phase 6)
   fixes that.

@@ -3,7 +3,14 @@
 //! A chunk is the unit of synthesis, prefetch and sentence navigation
 //! (next/previous). Kokoro's cost scales with audio length and has no
 //! per-call overhead worth amortizing (Phase 0), so chunks are single
-//! sentences; sentences longer than `max_len` split at a clause, then a space.
+//! sentences, and sentences longer than `clause_len` split at clause
+//! boundaries (, ; : dash) where the voice pauses anyway.
+//!
+//! Chunk length bounds interrupt latency: synthesis can't be preempted
+//! (Metal submits a graph as two command buffers and never checks an abort
+//! hook before both are queued), so a new job waits for the chunk in flight,
+//! about 23 ms per character on an M4. `max_len` is the hard cap; past it a
+//! sentence splits at a space.
 //!
 //! The first chunk of a job is kept short (first clause) because time to
 //! first audio is proportional to its length.
@@ -11,7 +18,10 @@
 const std = @import("std");
 
 pub const Options = struct {
-    max_len: usize = 220,
+    /// Split sentences longer than this at clause boundaries.
+    clause_len: usize = 100,
+    /// Hard cap; longer pieces without a clause boundary split at a space.
+    max_len: usize = 150,
     /// Split the job's first sentence at a clause boundary when it is longer
     /// than this; 0 disables.
     first_max: usize = 60,
@@ -81,6 +91,15 @@ fn clauseBreak(text: []const u8, lo: usize, hi: usize) ?usize {
     return null;
 }
 
+/// First clause boundary in text[lo..hi], or null.
+fn firstClauseBreak(text: []const u8, lo: usize, hi: usize) ?usize {
+    var i = lo;
+    while (i < @min(hi, text.len)) : (i += 1) {
+        if (clauseBreak(text, i, i + 1)) |b| return b;
+    }
+    return null;
+}
+
 fn lastSpace(text: []const u8, lo: usize, hi: usize) ?usize {
     var i = @min(hi, text.len);
     while (i > lo) : (i -= 1) {
@@ -103,9 +122,16 @@ fn pushSentence(gpa: std.mem.Allocator, out: *std.ArrayList(Chunk), sentence: []
             rest = std.mem.trim(u8, rest[cut..], " \t\r\n");
         }
     }
-    while (rest.len > opts.max_len) {
-        const cut = clauseBreak(rest, opts.max_len / 3, opts.max_len) orelse
-            lastSpace(rest, opts.max_len / 3, opts.max_len) orelse opts.max_len;
+    const min_piece = 20;
+    while (rest.len > opts.clause_len) {
+        // last clause before clause_len, else the first one before max_len
+        const cut = clauseBreak(rest, min_piece, opts.clause_len) orelse
+            firstClauseBreak(rest, opts.clause_len, opts.max_len) orelse
+            (if (rest.len > opts.max_len)
+                lastSpace(rest, opts.max_len / 3, opts.max_len) orelse opts.max_len
+            else
+                break);
+        if (rest.len - cut < min_piece / 2) break; // don't leave a tiny tail
         try push(gpa, out, rest[0..cut]);
         rest = std.mem.trim(u8, rest[cut..], " \t\r\n");
     }
@@ -161,10 +187,28 @@ test "first chunk is split at the first clause" {
 
 test "long sentences split at clauses, then spaces" {
     const long = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega";
-    const got = try chunk(std.testing.allocator, &.{long}, .{ .max_len = 50, .first_max = 0 });
+    const got = try chunk(std.testing.allocator, &.{long}, .{ .clause_len = 40, .max_len = 50, .first_max = 0 });
     defer std.testing.allocator.free(got);
     try std.testing.expect(got.len >= 3);
     for (got) |ch| try std.testing.expect(ch.text.len <= 50);
+}
+
+test "sentences over clause_len split at clauses, short ones stay whole" {
+    const s1 = "When several agents finish at the same time, their replies wait in a single queue, so you always hear one voice at a time, and you can pause or stop any of them.";
+    const got = try chunk(std.testing.allocator, &.{ s1, "A short sentence, with a comma." }, .{ .first_max = 0 });
+    defer std.testing.allocator.free(got);
+    for (got) |ch| try std.testing.expect(ch.text.len <= 150);
+    try std.testing.expect(got.len >= 3);
+    for (got[0 .. got.len - 2]) |ch| try std.testing.expect(ch.text[ch.text.len - 1] == ',');
+    try std.testing.expectEqualStrings("A short sentence, with a comma.", got[got.len - 1].text);
+}
+
+test "a long sentence without clauses splits at a space under max_len" {
+    const s1 = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
+    const got = try chunk(std.testing.allocator, &.{s1}, .{ .first_max = 0 });
+    defer std.testing.allocator.free(got);
+    try std.testing.expect(got.len == 2);
+    for (got) |ch| try std.testing.expect(ch.text.len <= 150);
 }
 
 test "block ends carry a pause" {

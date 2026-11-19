@@ -563,10 +563,20 @@ Decisions and deviations:
 - **Interrupt drops the interrupted job.** It doesn't stay resumable yet.
 
 Known limitations, to fix later:
-- **Synthesis can't be preempted.** An interrupt or skip that arrives while the
-  engine is synthesizing a long prefetched sentence waits for it to finish (up
-  to about 3 s for a 220-char chunk). Options: lower `max_len`, or let the shim
-  check a cancel flag between Kokoro segments.
+- **Synthesis can't be preempted.** An interrupt waits for the chunk being
+  synthesized. A cancel check doesn't help:
+  - Each chunk is one Kokoro segment.
+  - About 97% of the time is a single vocoder graph inside libmtmd, which
+    exposes no abort hook.
+  - Even with a patch, ggml-metal runs a graph as 2 command buffers
+    (`n_cb = 1`), always submits the first two, and only checks an abort
+    callback after that, so it would never fire.
+  Instead, chunks are now shorter: sentences over 100 chars split at clause
+  boundaries (`, ; :` and dashes), with a hard cap of 150 chars. Measured over 12
+  random interrupts during playback, the median went from 1.76 s to 1.00 s,
+  the mean from 2.17 s to 1.22 s, and the worst case from 4.51 s to 2.39 s.
+  Revisit if splits at commas sound choppy, or upstream an mtmd abort API
+  together with a larger `n_cb`.
 - `/mcp` and `/v1/audio/speech` aren't built yet (Phase 4).
 
 **Phase 2: Mac shell**

@@ -522,7 +522,11 @@ Run with `zig build --release spike -- [--voice V] [--speed S] [--cpu] ["text"]`
 **Phase 2: Mac shell**
 - Xcode project linking `libtalk.a`, the menu bar menu, and the settings
   window (General, Models, Voices) with first-run onboarding.
-- Requires full Xcode (for `xcodebuild` and the `metal` compiler). Switch the
+- Requires full Xcode (for `xcodebuild` and the `metal` compiler). The dev Mac
+  stays on macOS Sequoia, so use **Xcode 26.3**, the last release that runs on
+  Sequoia (15.6+). It's downloaded from developer.apple.com/download/all, since
+  the App Store only offers Xcode 27, which needs Tahoe 26.6. Fetch the Metal
+  toolchain with `xcodebuild -downloadComponent MetalToolchain`. Switch the
   engine to a precompiled `default.metallib` in `Contents/Resources` so the
   first launch skips the 12–14 s shader compile.
 - *Done when:* starting from a fresh install, you can download Kokoro, preview

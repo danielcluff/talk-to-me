@@ -120,7 +120,7 @@ pub const Summary = struct {
     }
 };
 
-pub const EventKind = enum { job_queued, job_started, chunk_started, job_finished, player_state, model_state };
+pub const EventKind = enum { job_queued, job_started, chunk_started, job_finished, player_state, model_state, pair_request };
 
 pub const Event = struct {
     seq: u64 = 0,
@@ -256,6 +256,9 @@ pub const Core = struct {
         var out = s;
         out.model = try a.dupe(u8, s.model);
         out.voice = try a.dupe(u8, s.voice);
+        const origins = try a.alloc([]const u8, s.paired_origins.len);
+        for (s.paired_origins, origins) |o, *d| d.* = try a.dupe(u8, o);
+        out.paired_origins = origins;
         out.sources = .{};
         var it = s.sources.map.iterator();
         while (it.next()) |e| {
@@ -290,6 +293,17 @@ pub const Core = struct {
     }
 
     // ------------------------------------------------------------ events
+
+    /// Post an event from outside the core (e.g. a pairing request).
+    pub fn emit(self: *Core, e: Event) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.pushEvent(e);
+    }
+
+    pub fn eventWithState(kind: EventKind, index: u32, state: []const u8) Event {
+        return (Event{ .kind = kind, .index = index }).withState(state);
+    }
 
     fn pushEvent(self: *Core, e: Event) void {
         // caller holds mu

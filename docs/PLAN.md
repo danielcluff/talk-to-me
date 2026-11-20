@@ -761,6 +761,59 @@ Still to check: a real turn in each agent (new sessions load the plugins).
   auto-read.
 - *Done when:* the kokoro-reader e2e test passes against the new backend.
 
+**Phase 5 results (2026-11-19)**
+
+Built:
+- **The extension** in `integrations/browser/`, ported from kokoro-reader.
+  It's shipped in the app's Resources and copied to the stable folder
+  `~/Library/Application Support/TalkToMe/browser-extension`, because Chrome
+  ties an unpacked extension's ID, and so its pairing, to its folder.
+  - **Playback is in the app:** `POST /v1/speak` with the page's sentences,
+    source `browser`, label, and session `tab-<id>`. Transport goes through
+    `/v1/player/*`. The audio player and keep-alive tone are gone.
+  - **The offscreen document holds `GET /v1/events`** (a fetch stream, since
+    `EventSource` can't send the token) and forwards `chunk_started`,
+    `job_finished` and `player_state` events, so the page highlight follows
+    what the app is saying.
+  - **Popup:** connection status and Connect, now playing, read actions, the
+    floating-button toggle, "read new ChatGPT replies" and "read new Claude
+    replies" (both off by default), and paste or drop text and files. Voice
+    and speed moved to the app (Sources → Browser).
+  - **Shortcuts:** "Read last reply" moved to ⌥⇧L and "Read this tab" stays
+    ⌥⇧A. Read Selection and Stop are the app's global ⌥⇧R and ⌥⇧X.
+  - **Chunking matches the app:** one sentence per chunk, clause splits over
+    100 chars, a 150 cap, and a short first chunk. Pasted text is chunked by
+    the app.
+  - **Auto-read** watches the page and reads a reply only after it was seen
+    streaming and then settled (ChatGPT's stop button, Claude's
+    `data-is-streaming`), so opening a conversation never reads its history.
+    Such reads are queued and marked `kind: reply` for Phase 7.
+- **Pairing in the server:**
+  - `POST /v1/pair` works only from an extension Origin, and returns an id, a
+    secret and a 4-digit code.
+  - The app shows "Allow a browser extension…" with the code (the
+    `pair_request` event). `talktome pair approve|deny ID` does the same from
+    the terminal.
+  - `GET /v1/pair/{id}?secret=` hands out the token once.
+  - Paired origins are stored in `settings.paired_origins`. Any other Origin
+    is refused, and a browser can never approve a pairing.
+  - `talktome pair forget ORIGIN` and Sources → Browser → Remove revoke one.
+- **Sources → Browser card:** paired extensions with Remove, install steps,
+  Show Extension Folder, and voice and announce settings.
+
+Verified:
+- Pairing rules with curl: a web page can't pair, a wrong secret gets
+  nothing, an extension can't approve itself, the token is handed out once,
+  other extensions are refused, and forget revokes.
+- An end-to-end run in a test Brave profile through CDP, 11 of 11 checks:
+  pairing via the CLI with matching codes, reading a page through the app,
+  chunk events advancing with the page highlight following, pause and resume
+  coming back from the app, stop clearing the highlight, and popup text
+  chunked by the app.
+
+Not verified: auto-read on the live ChatGPT and Claude sites (needs your
+accounts), and the app's pairing dialog (the CLI approved in the test).
+
 **Phase 6: more models and polish**
 - tiny-voca, Soprano, Chatterbox Turbo and ZONOS3; History; pronunciation
   dictionary; Developer ID signing and notarization; launch at login.

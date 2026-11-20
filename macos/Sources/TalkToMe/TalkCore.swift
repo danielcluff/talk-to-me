@@ -1,3 +1,4 @@
+import AppKit
 import CTalk
 import Foundation
 import SwiftUI
@@ -120,7 +121,8 @@ private struct ModelList: Decodable { var models: [ModelInfo] }
 private struct VoiceList: Decodable { var model: String; var voices: [VoiceInfo] }
 private struct JobList: Decodable { var jobs: [JobInfo] }
 private struct APIError: Decodable { var error: String }
-private struct CoreEvent: Decodable { var type: String; var state: String? }
+private struct CoreEvent: Decodable { var type: String; var state: String?; var index: Int? }
+private struct PairList: Decodable { var paired: [String] }
 
 // MARK: - Store
 
@@ -235,6 +237,10 @@ final class TalkCore: ObservableObject {
 
     private func handleEvent(_ data: Data) {
         guard let e = try? JSONDecoder().decode(CoreEvent.self, from: data) else { return }
+        if e.type == "pair_request", let id = e.index {
+            askToPair(id: id, code: e.state ?? "")
+            return
+        }
         Task {
             switch e.type {
             case "model_state":
@@ -246,6 +252,37 @@ final class TalkCore: ObservableObject {
             default:
                 await refreshPlayer()
             }
+        }
+    }
+
+    // MARK: browser pairing
+
+    @Published var pairedOrigins: [String] = []
+
+    /// A browser extension asked to connect: show its code so the person can
+    /// match it against the one in the extension, then approve or deny.
+    private func askToPair(id: Int, code: String) {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Allow a browser extension to use Talk to Me?"
+        alert.informativeText = "The Talk to Me extension is asking to connect.\n\nCode: \(code)\n\nAllow it only if the extension shows the same code."
+        alert.addButton(withTitle: "Allow")
+        alert.addButton(withTitle: "Deny")
+        let allow = alert.runModal() == .alertFirstButtonReturn
+        Task {
+            await send("POST", "/v1/pair/\(id)/\(allow ? "approve" : "deny")")
+            await refreshPaired()
+        }
+    }
+
+    func refreshPaired() async {
+        if let p = await get("/v1/pair", as: PairList.self) { pairedOrigins = p.paired }
+    }
+
+    func forgetPaired(_ origin: String) {
+        Task {
+            await send("POST", "/v1/pair/forget", ["origin": origin])
+            await refreshPaired()
         }
     }
 

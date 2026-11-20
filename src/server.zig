@@ -26,7 +26,41 @@ pub const Server = struct {
     /// `talktome serve` exits on POST /v1/shutdown so the app can take over
     /// the port; the app's in-process server ignores it.
     allow_shutdown: bool = false,
+    pairing: Pairing = .{},
 };
+
+/// Browser extension pairing. An extension asks (POST /v1/pair, from an
+/// extension Origin only); the app or CLI approves it; the extension then
+/// collects the token once with its pairing secret.
+const Pairing = struct {
+    mu: Io.Mutex = .init,
+    next_id: u32 = 1,
+    items: [8]?Pair = @splat(null),
+
+    const Pair = struct {
+        id: u32,
+        origin: [160]u8 = @splat(0),
+        secret: [32]u8,
+        code: [4]u8,
+        status: enum { pending, approved, denied } = .pending,
+
+        fn originStr(p: *const Pair) []const u8 {
+            return std.mem.sliceTo(&p.origin, 0);
+        }
+    };
+};
+
+fn isExtensionOrigin(origin: []const u8) bool {
+    return std.mem.startsWith(u8, origin, "chrome-extension://") or
+        std.mem.startsWith(u8, origin, "moz-extension://") or
+        std.mem.startsWith(u8, origin, "safari-web-extension://");
+}
+
+fn originPaired(s: *Server, a: std.mem.Allocator, origin: []const u8) bool {
+    const settings = s.core.getSettings(a) catch return false;
+    for (settings.paired_origins) |o| if (std.mem.eql(u8, o, origin)) return true;
+    return false;
+}
 
 /// True if something accepts connections on the port.
 pub fn portInUse(io: Io, port: u16) bool {
@@ -167,7 +201,21 @@ fn handle(s: *Server, req: *http.Server.Request, a: std.mem.Allocator) !void {
     const path = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[0..q] else target;
 
     if (!hostAllowed(s, head.host)) return respondError(req, a, .forbidden, "bad host");
-    if (head.origin != null) return respondError(req, a, .forbidden, "browser origins are not allowed yet");
+
+    // pairing: an extension asks, then polls with its secret (no token yet)
+    if (method == .POST and std.mem.eql(u8, path, "/v1/pair")) return pairRequest(s, req, a, head.origin);
+    if (method == .GET and std.mem.startsWith(u8, path, "/v1/pair/") and std.mem.indexOfScalar(u8, path["/v1/pair/".len..], '/') == null) {
+        return pairStatus(s, req, a, path["/v1/pair/".len..], target);
+    }
+
+    // web pages never get in; a paired extension does, with the token
+    if (head.origin) |origin| {
+        if (!isExtensionOrigin(origin) or !originPaired(s, a, origin)) {
+            return respondError(req, a, .forbidden, "this origin is not paired with Talk to Me");
+        }
+        // approving a pairing is for the app and the CLI only
+        if (std.mem.startsWith(u8, path, "/v1/pair")) return respondError(req, a, .forbidden, "not allowed from a browser");
+    }
     const public = method == .GET and std.mem.eql(u8, path, "/v1/health");
     if (!public and !tokenOk(s, head.auth)) return respondError(req, a, .unauthorized, "missing or bad token");
     if (method == .GET and std.mem.eql(u8, path, "/v1/events")) return events(s, req, a);
@@ -205,6 +253,7 @@ pub fn dispatch(s: *Server, ex: *Exchange, a: std.mem.Allocator, method: http.Me
         t.detach();
         return sendJson(req, a, .ok, .{ .ok = true });
     }
+    if (std.mem.startsWith(u8, path, "/v1/pair")) return pairAdmin(s, req, a, method, path);
     if (method == .POST and std.mem.eql(u8, path, "/v1/speak")) return speak(s, req, a);
     if (method == .POST and std.mem.eql(u8, path, "/v1/speak/file")) return speakFile(s, req, a);
     if (method == .GET and std.mem.eql(u8, path, "/v1/jobs")) return sendJson(req, a, .ok, .{ .jobs = try s.core.jobViews(a) });
@@ -398,6 +447,134 @@ fn patchSettings(s: *Server, req: *Exchange, a: std.mem.Allocator) !void {
     }
     s.core.setSettings(settings) catch |err| return sendError(req, a, .internal_server_error, @errorName(err));
     return sendJson(req, a, .ok, try s.core.getSettings(a));
+}
+
+// ------------------------------------------------------------------ pairing
+
+fn pairRequest(s: *Server, req: *http.Server.Request, a: std.mem.Allocator, origin: ?[]const u8) !void {
+    const o = origin orelse return respondError(req, a, .forbidden, "pairing needs an extension Origin");
+    if (!isExtensionOrigin(o) or o.len >= 160) return respondError(req, a, .forbidden, "only browser extensions can pair");
+    var p: Pairing.Pair = .{ .id = 0, .secret = undefined, .code = undefined };
+    var raw: [16]u8 = undefined;
+    s.io.random(&raw);
+    _ = std.fmt.bufPrint(&p.secret, "{x}", .{&raw}) catch unreachable;
+    var n: [2]u8 = undefined;
+    s.io.random(&n);
+    _ = std.fmt.bufPrint(&p.code, "{d:0>4}", .{std.mem.readInt(u16, &n, .little) % 10000}) catch unreachable;
+    @memcpy(p.origin[0..o.len], o);
+
+    s.pairing.mu.lockUncancelable(s.io);
+    p.id = s.pairing.next_id;
+    s.pairing.next_id += 1;
+    // keep the newest 8 requests
+    var slot: usize = 0;
+    var oldest: u32 = std.math.maxInt(u32);
+    for (s.pairing.items, 0..) |it, i| {
+        if (it == null) {
+            slot = i;
+            break;
+        }
+        if (it.?.id < oldest) {
+            oldest = it.?.id;
+            slot = i;
+        }
+    }
+    s.pairing.items[slot] = p;
+    s.pairing.mu.unlock(s.io);
+
+    s.core.emit(core_mod.Core.eventWithState(.pair_request, p.id, &p.code));
+    const body = try std.json.Stringify.valueAlloc(a, .{ .pair_id = p.id, .secret = &p.secret, .code = &p.code }, .{});
+    try req.respond(body, .{ .status = .accepted, .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
+}
+
+/// GET /v1/pair/{id}?secret=... : status, and the token once approved.
+fn pairStatus(s: *Server, req: *http.Server.Request, a: std.mem.Allocator, id_text: []const u8, target: []const u8) !void {
+    const id = std.fmt.parseInt(u32, id_text, 10) catch return respondError(req, a, .bad_request, "bad pairing id");
+    const q = std.mem.indexOf(u8, target, "secret=") orelse return respondError(req, a, .unauthorized, "secret required");
+    var secret = target[q + "secret=".len ..];
+    if (std.mem.indexOfScalar(u8, secret, '&')) |amp| secret = secret[0..amp];
+
+    s.pairing.mu.lockUncancelable(s.io);
+    var status: []const u8 = "unknown";
+    var token: ?[]const u8 = null;
+    for (&s.pairing.items) |*slot| {
+        const p = &(slot.* orelse continue);
+        if (p.id != id or !std.mem.eql(u8, &p.secret, secret)) continue;
+        switch (p.status) {
+            .pending => status = "pending",
+            .denied => {
+                status = "denied";
+                slot.* = null;
+            },
+            .approved => {
+                status = "approved";
+                token = s.token;
+                slot.* = null; // the token is handed out once
+            },
+        }
+        break;
+    }
+    s.pairing.mu.unlock(s.io);
+    const body = try std.json.Stringify.valueAlloc(a, .{ .status = status, .token = token }, .{ .emit_null_optional_fields = false });
+    try req.respond(body, .{ .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }} });
+}
+
+/// Authenticated (app, CLI): GET /v1/pair (pending + paired),
+/// POST /v1/pair/{id}/approve|deny, POST /v1/pair/forget {"origin": ...}.
+fn pairAdmin(s: *Server, req: *Exchange, a: std.mem.Allocator, method: http.Method, path: []const u8) !void {
+    if (method == .GET and std.mem.eql(u8, path, "/v1/pair")) {
+        const Pending = struct { id: u32, origin: []const u8, code: []const u8 };
+        var pending: std.ArrayList(Pending) = .empty;
+        s.pairing.mu.lockUncancelable(s.io);
+        for (&s.pairing.items) |*slot| if (slot.*) |*p| if (p.status == .pending) {
+            try pending.append(a, .{ .id = p.id, .origin = try a.dupe(u8, p.originStr()), .code = try a.dupe(u8, &p.code) });
+        };
+        s.pairing.mu.unlock(s.io);
+        const settings = try s.core.getSettings(a);
+        return sendJson(req, a, .ok, .{ .pending = pending.items, .paired = settings.paired_origins });
+    }
+    if (method == .POST and std.mem.eql(u8, path, "/v1/pair/forget")) {
+        const F = struct { origin: []const u8 };
+        const f = std.json.parseFromSliceLeaky(F, a, req.body, .{ .ignore_unknown_fields = true }) catch
+            return sendError(req, a, .bad_request, "origin required");
+        var settings = try s.core.getSettings(a);
+        var keep: std.ArrayList([]const u8) = .empty;
+        for (settings.paired_origins) |o| if (!std.mem.eql(u8, o, f.origin)) try keep.append(a, o);
+        settings.paired_origins = keep.items;
+        try s.core.setSettings(settings);
+        return sendJson(req, a, .ok, .{ .ok = true });
+    }
+    if (method == .POST and std.mem.startsWith(u8, path, "/v1/pair/")) {
+        const rest = path["/v1/pair/".len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return sendError(req, a, .not_found, "not found");
+        const id = std.fmt.parseInt(u32, rest[0..slash], 10) catch return sendError(req, a, .bad_request, "bad pairing id");
+        const approve = std.mem.eql(u8, rest[slash + 1 ..], "approve");
+        if (!approve and !std.mem.eql(u8, rest[slash + 1 ..], "deny")) return sendError(req, a, .not_found, "not found");
+
+        var origin: ?[]const u8 = null;
+        s.pairing.mu.lockUncancelable(s.io);
+        for (&s.pairing.items) |*slot| if (slot.*) |*p| if (p.id == id and p.status == .pending) {
+            p.status = if (approve) .approved else .denied;
+            origin = try a.dupe(u8, p.originStr());
+        };
+        s.pairing.mu.unlock(s.io);
+        const o = origin orelse return sendError(req, a, .not_found, "no pending pairing with that id");
+        if (approve) {
+            var settings = try s.core.getSettings(a);
+            const already = for (settings.paired_origins) |x| {
+                if (std.mem.eql(u8, x, o)) break true;
+            } else false;
+            if (!already) {
+                const list = try a.alloc([]const u8, settings.paired_origins.len + 1);
+                @memcpy(list[0..settings.paired_origins.len], settings.paired_origins);
+                list[list.len - 1] = o;
+                settings.paired_origins = list;
+                try s.core.setSettings(settings);
+            }
+        }
+        return sendJson(req, a, .ok, .{ .ok = true, .origin = o, .approved = approve });
+    }
+    return sendError(req, a, .not_found, "not found");
 }
 
 /// One event as JSON; the same shape for SSE and the C interface.

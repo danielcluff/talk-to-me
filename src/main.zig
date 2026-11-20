@@ -55,6 +55,9 @@ pub const usage =
     \\  install TARGET       claude | codex | opencode | herdr
     \\  uninstall TARGET
     \\  integrations [--json] what is installed
+    \\  pair                 browser extensions waiting for approval, and paired ones
+    \\  pair approve|deny ID
+    \\  pair forget ORIGIN   unpair an extension
     \\  hook claude|codex|opencode   (called by the agents' hooks)
     \\  mcp [--app NAME]     MCP server on stdio (speak, stop, list_voices)
     \\  help
@@ -120,6 +123,7 @@ fn run(init: std.process.Init) !void {
     if (eql(cmd, "voices")) return voices(&ctx);
     if (eql(cmd, "models")) return modelsCmd(&ctx, rest);
     if (eql(cmd, "config")) return configCmd(&ctx, rest);
+    if (eql(cmd, "pair")) return pairCmd(&ctx, rest);
     if (eql(cmd, "hook")) return integrations.hook(&ctx, rest);
     if (eql(cmd, "mcp")) return integrations.mcp(&ctx, rest);
     if (eql(cmd, "install")) return integrations.installCmd(&ctx, rest, true);
@@ -530,4 +534,27 @@ fn configCmd(ctx: *Ctx, rest: []const []const u8) !void {
         return out(ctx.io, "\n");
     }
     return fail(ctx, "usage: talktome config [set KEY VALUE]", .{});
+}
+
+fn pairCmd(ctx: *Ctx, rest: []const []const u8) !void {
+    try ensureServer(ctx);
+    if (rest.len == 0) {
+        const P = struct { id: u32, origin: []const u8, code: []const u8 };
+        const L = struct { pending: []P, paired: []const []const u8 };
+        const list = try std.json.parseFromSliceLeaky(L, ctx.arena, try request(ctx, .GET, "/v1/pair", null), .{ .ignore_unknown_fields = true });
+        if (list.pending.len == 0) try out(ctx.io, "no pairing requests\n");
+        for (list.pending) |p| try outf(ctx, "request {d}: code {s} from {s}\n", .{ p.id, p.code, p.origin });
+        for (list.paired) |o| try outf(ctx, "paired: {s}\n", .{o});
+        return;
+    }
+    if ((eql(rest[0], "approve") or eql(rest[0], "deny")) and rest.len == 2) {
+        _ = try request(ctx, .POST, try std.fmt.allocPrint(ctx.arena, "/v1/pair/{s}/{s}", .{ rest[1], rest[0] }), "{}");
+        return outf(ctx, "{s}d request {s}\n", .{ if (eql(rest[0], "approve")) "approve" else "denie", rest[1] });
+    }
+    if (eql(rest[0], "forget") and rest.len == 2) {
+        const body = try std.json.Stringify.valueAlloc(ctx.arena, .{ .origin = rest[1] }, .{});
+        _ = try request(ctx, .POST, "/v1/pair/forget", body);
+        return outf(ctx, "unpaired {s}\n", .{rest[1]});
+    }
+    return fail(ctx, "usage: talktome pair [approve|deny ID | forget ORIGIN]", .{});
 }

@@ -34,6 +34,9 @@ pub const Settings = struct {
     /// identical text from the same source within this window is dropped
     dedupe_seconds: u32 = 30,
     sources: std.json.ArrayHashMap(SourceSettings) = .{},
+    /// browser extensions allowed to call the API (Origin header values),
+    /// added by approving a pairing request
+    paired_origins: []const []const u8 = &.{},
 };
 
 /// Spoken and displayed name of a source app.

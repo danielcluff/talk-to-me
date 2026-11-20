@@ -378,6 +378,7 @@ struct SourcesPage: View {
         Group { content }
             .task {
                 await core.refreshIntegrations()
+                await core.refreshPaired()
                 if core.voices.isEmpty { await core.refreshVoices() }
             }
     }
@@ -385,11 +386,73 @@ struct SourcesPage: View {
     @ViewBuilder private var content: some View {
         PageHeader(title: "Sources", subtitle: "Agents that speak their replies. Give each its own voice to tell them apart by ear.")
         ForEach(Integration.all) { i in card(i) }
+        browserCard
         if let msg = core.integrationMessage {
             Text(msg).font(.callout).foregroundStyle(.secondary)
         }
         Text("Install writes to the agent's own config (Codex keeps a backup of config.toml). Restart open agent sessions afterwards.")
             .font(.callout).foregroundStyle(.secondary)
+    }
+
+    /// The unpacked extension lives at a stable path (Chrome ties an unpacked
+    /// extension's identity, and so its pairing, to the folder). The copy is
+    /// refreshed from the app bundle each time it's revealed.
+    private var browserExtensionURL: URL? {
+        guard let bundled = Bundle.main.resourceURL?.appendingPathComponent("integrations/browser") else { return nil }
+        let support = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/TalkToMe/browser-extension")
+        let fm = FileManager.default
+        do {
+            try fm.createDirectory(at: support.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if fm.fileExists(atPath: support.path) {
+                // replace the files in place so the folder (and Chrome's ID) stays
+                for item in try fm.contentsOfDirectory(atPath: support.path) {
+                    try fm.removeItem(at: support.appendingPathComponent(item))
+                }
+                for item in try fm.contentsOfDirectory(atPath: bundled.path) {
+                    try fm.copyItem(at: bundled.appendingPathComponent(item), to: support.appendingPathComponent(item))
+                }
+            } else {
+                try fm.copyItem(at: bundled, to: support)
+            }
+            return support
+        } catch {
+            return bundled
+        }
+    }
+
+    private var browserCard: some View {
+        let src = core.source("browser")
+        return Card {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Browser").font(.title3.weight(.semibold))
+                if !core.pairedOrigins.isEmpty { Badge(text: "Paired", color: .green) }
+                Spacer()
+                Button("Show Extension Folder") {
+                    if let url = browserExtensionURL { NSWorkspace.shared.activateFileViewerSelecting([url]) }
+                }
+            }
+            Text("Reads pages, selections and ChatGPT or Claude replies through the same queue, highlighting each sentence as it's spoken.")
+                .foregroundStyle(.secondary)
+            Text("Install: open chrome://extensions (or Brave, Edge, Arc), turn on Developer mode, click Load unpacked and pick the folder that opens (~/Library/Application Support/TalkToMe/browser-extension). Then open the extension's popup and click Connect; Talk to Me asks you to allow it. After an app update, click Show Extension Folder again and reload the extension.")
+                .font(.callout).foregroundStyle(.secondary)
+            ForEach(core.pairedOrigins, id: \.self) { origin in
+                HStack {
+                    Text(origin).font(.callout.monospaced()).lineLimit(1).truncationMode(.middle)
+                    Spacer()
+                    Button("Remove") { core.forgetPaired(origin) }
+                }
+            }
+            Divider()
+            Toggle("Read its replies aloud", isOn: Binding(get: { src.enabled }, set: { core.updateSource("browser", ["enabled": $0]) }))
+            Toggle("Say its name first", isOn: Binding(get: { src.announce }, set: { core.updateSource("browser", ["announce": $0]) }))
+            Picker("Voice", selection: Binding(get: { src.voice }, set: { core.updateSource("browser", ["voice": $0]) })) {
+                Text("Default voice").tag("")
+                ForEach(core.voices) { v in
+                    Text("\(v.displayName) (\(v.accent) \(v.gender))").tag(v.name)
+                }
+            }
+        }
     }
 
     private func card(_ i: Integration) -> some View {

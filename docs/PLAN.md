@@ -800,60 +800,90 @@ short summary, then asks whether you want the whole thing.
   existing queue policy). Later option: if reports pile up past N, merge them
   into one ("Three agents finished: …").
 
-*Picking the agent (summarizer backends)* behind one interface,
-`summarize(report, source) -> text`:
-- **Local model, in-process (recommended default).** A small instruct GGUF
-  (for example Qwen3 1.7B or 4B) loaded by the same llama.cpp engine. Fully
-  local, no account, about 1 to 2 s per summary on the M4 (to measure).
-  Downloaded from the Models page like TTS models.
-- **Ollama.** Uses a model you already run (your `opencode.json` points at
-  Ollama on localhost).
-- **Claude Code** (`claude -p` with a summary prompt) or **Codex**
-  (`codex exec`): the strongest summaries, but the report goes to that
-  provider's cloud. Off unless you pick it, and Settings says so plainly.
-- **Common pieces:** the prompt is shared (spoken style, no markdown, lead
-  with outcome, then blockers and questions for you, at most about 60
-  words). If the summarizer fails or times out (8 s), fall back to reading
-  the first paragraph plus "full report available".
+*Default: off.* Briefings are off until you turn them on. Settings →
+Briefing explains what they do, how each option works and what it costs,
+and walks through setup with a "Test" button that summarizes a sample
+report and speaks it.
+
+*Summarizer backends* (pick one; each has a model field), behind one
+interface, `summarize(report, source) -> text`:
+
+| Backend | How it runs | Where the report goes |
+|---|---|---|
+| **Local model** | In-process through the same llama.cpp engine; downloaded from Models | Stays on the Mac |
+| **Ollama** | `POST /api/chat` on localhost, any model you've pulled | Stays on the Mac |
+| **Codex** | `codex exec -m <model>` (e.g. Luna: light on tokens and fast) | OpenAI |
+| **Claude Code** | `claude -p --model <model>` | Anthropic |
+| **OpenCode** | `opencode run -m <provider/model>`, using your OpenCode providers (local Ollama or cloud) | Wherever that provider is |
+
+herdr isn't on the list: it runs agents but has no model of its own, so it
+reaches a summarizer through one of the others.
+
+The cloud backends are labeled plainly in Settings. Each runs headless with
+no tools and a fixed prompt (spoken style, no markdown, lead with the
+outcome, then blockers and questions for you, at most about 60 words). On a
+failure or after 8 s, it falls back to reading the first paragraph and
+saying the full report is available.
+
+*Local model options and memory.* Resident memory is about the file size
+plus the context cache. A report of up to 4k tokens needs about 0.45 to
+0.6 GB of cache at f16, roughly half that with a q8 cache.
+
+| Model | File | RAM while loaded | Notes |
+|---|---|---|---|
+| Qwen3 0.6B Q8_0 | 805 MB | ~1.2 GB | fastest, weakest summaries |
+| Gemma 3 1B Q4_K_M | 806 MB | ~1.1 GB | small, decent |
+| **Qwen3 1.7B Q4_K_M** | 1.28 GB | ~1.8 GB | recommended local default |
+| Qwen3 4B Q4_K_M | 2.50 GB | ~3.1 GB | best local quality |
+| Gemma 3 4B Q4_K_M | 2.49 GB | ~3.0 GB | alternative 4B |
+
+- For scale, Kokoro uses about 430 MB.
+- Like the TTS model, the summarizer loads on first use and unloads after
+  the idle timeout.
+- With Codex, Claude Code, OpenCode on a cloud model, or Ollama, it adds
+  nothing to Talk to Me's memory. Ollama holds its own.
 
 *Listening for yes or no*
-- **Local speech recognition** with Qwen3-ASR 0.6B through libmtmd, which
-  llama.cpp already supports (`common_chat_get_asr_prompt`, with a hotwords
-  hint: "yes, no, read it, skip, sure"). It's downloaded from Models as an
-  optional "Listening" model.
+- **Apple on-device speech (default).** `SFSpeechRecognizer` with
+  `requiresOnDeviceRecognition`. It works on Sequoia, needs no download and
+  adds no memory to speak of. It needs Speech Recognition and Microphone
+  permission (on the Permissions page).
+- **Qwen3-ASR 0.6B (optional, fully in our engine).** Q8_0 805 MB plus
+  mmproj 214 MB, about 1.1 GB while loaded, through libmtmd
+  (`common_chat_get_asr_prompt`, with a hotwords hint: "yes, no, read it,
+  skip, sure"). It's offered on Models if Apple's recognizer proves
+  unreliable for short answers.
 - **The microphone opens only for the answer window,** after playback of the
-  question ends, so the app never hears its own voice. It needs Microphone
-  permission (on the Permissions page). The menu bar icon shows a listening
-  state.
-- **Simple matching:** recognized text is matched against yes and no word
-  lists, and anything else counts as no answer. Optional later: a "Listen for
-  an answer" toggle per source, and a longer window.
-- **Fallback if ASR quality or latency disappoints:** Apple's on-device
-  `SFSpeechRecognizer` (works on Sequoia, no download), behind the same
-  interface.
+  question ends, so the app never hears its own voice. The menu bar icon
+  shows a listening state.
+- **Matching:** recognized text is matched against editable yes and no word
+  lists, and anything else counts as no answer.
 - **Mic sharing with VoiceInk:** both use the mic only while active, so they
   shouldn't conflict. To verify.
 
+*Peak memory, everything local:* Kokoro 0.43 GB, Qwen3 1.7B 1.8 GB and
+Qwen3-ASR 1.1 GB come to about 3.3 GB. With Codex as the summarizer and
+Apple speech: about 0.45 GB, the same as today.
+
 *Settings*
-- A **Briefing** page: on/off, the summarizer backend and model, the
-  summary-length hint, the listen window (2 to 8 s), "listen for an answer"
-  on/off, and the yes/no words.
-- **Sources** gets a per-agent "Brief me / Read in full" choice.
+- A **Briefing** page: on/off (default off), an explanation and setup steps,
+  the backend and model with a Test button, the summary-length hint, the
+  listen window (2 to 8 s), "listen for an answer" on/off, the speech
+  recognizer (Apple or Qwen3-ASR), and the yes/no words.
+- **Sources** gets a per-agent "Brief me / Read in full" choice, used only
+  while briefings are on.
 - **Models** lists the summarizer and ASR models next to the voices.
 
 *Done when*
-- A multi-paragraph Codex or Claude report is spoken as a short summary plus
-  "Want the full report?".
+- With briefings on and any backend, a multi-paragraph Codex or Claude
+  report is spoken as a short summary plus "Want the full report?".
 - Saying "yes" reads the full report; "no" or silence ends it.
 - The full report stays reachable from the menu, the hotkey and History.
-- The summary arrives within about 3 s of the agent finishing with the local
-  model.
+- The summary arrives within about 3 s of the agent finishing, with the
+  local 1.7B model or Codex Luna.
 
-*Open questions*
-- The default summarizer: local model (private, slower setup) or your existing
-  Claude/Codex (better summaries, leaves the machine)?
-- Should a briefing also offer actions beyond reading, such as "open that
-  tab in herdr"?
+*Open question:* should a briefing also offer actions beyond reading, such
+as "open that tab in herdr"?
 
 ---
 

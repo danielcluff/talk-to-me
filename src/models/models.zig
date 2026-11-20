@@ -17,8 +17,11 @@ pub const File = struct {
     sha256: []const u8,
 };
 
+pub const Kind = enum { voice, summary, listening };
+
 pub const Model = struct {
     id: []const u8,
+    kind: Kind = .voice,
     name: []const u8,
     description: []const u8 = "",
     recommended: bool = false,
@@ -26,7 +29,8 @@ pub const Model = struct {
     repo: []const u8,
     revision: []const u8,
     model: File,
-    mmproj: File,
+    /// voice and listening models have a projector; summary models don't
+    mmproj: ?File = null,
     default_voice: []const u8,
     /// English voice filter (name prefixes); empty = all voices
     voice_prefixes: []const []const u8 = &.{},
@@ -35,7 +39,7 @@ pub const Model = struct {
     supports_speed: bool = true,
 
     pub fn totalSize(m: Model) u64 {
-        return m.model.size + m.mmproj.size;
+        return m.model.size + (if (m.mmproj) |mm| mm.size else 0);
     }
 
     pub fn isEnglishVoice(m: Model, voice: []const u8) bool {
@@ -81,6 +85,7 @@ pub const Catalog = struct {
 pub const LocalPaths = struct {
     dir: []const u8,
     model: [:0]const u8,
+    /// empty when the model has no projector
     mmproj: [:0]const u8,
 };
 
@@ -89,7 +94,7 @@ pub fn localPaths(arena: std.mem.Allocator, models_root: []const u8, m: Model) !
     return .{
         .dir = dir,
         .model = try std.fs.path.joinZ(arena, &.{ dir, m.model.file }),
-        .mmproj = try std.fs.path.joinZ(arena, &.{ dir, m.mmproj.file }),
+        .mmproj = if (m.mmproj) |mm| try std.fs.path.joinZ(arena, &.{ dir, mm.file }) else "",
     };
 }
 
@@ -101,7 +106,9 @@ fn fileSize(io: Io, path: []const u8) ?u64 {
 /// Installed = both files present with the catalog size (hashes are checked
 /// when downloading).
 pub fn isInstalled(io: Io, lp: LocalPaths, m: Model) bool {
-    return fileSize(io, lp.model) == m.model.size and fileSize(io, lp.mmproj) == m.mmproj.size;
+    if (fileSize(io, lp.model) != m.model.size) return false;
+    const mm = m.mmproj orelse return true;
+    return fileSize(io, lp.mmproj) == mm.size;
 }
 
 pub fn sha256Hex(io: Io, path: []const u8, out: *[64]u8) !void {
@@ -144,7 +151,14 @@ pub fn download(gpa: std.mem.Allocator, io: Io, models_root: []const u8, m: Mode
 
     progress.total.store(m.totalSize(), .monotonic);
     var base: u64 = 0;
-    for ([_]struct { f: File, path: []const u8 }{ .{ .f = m.model, .path = lp.model }, .{ .f = m.mmproj, .path = lp.mmproj } }) |item| {
+    var items_buf: [2]struct { f: File, path: []const u8 } = undefined;
+    items_buf[0] = .{ .f = m.model, .path = lp.model };
+    var n_items: usize = 1;
+    if (m.mmproj) |mm| {
+        items_buf[1] = .{ .f = mm, .path = lp.mmproj };
+        n_items = 2;
+    }
+    for (items_buf[0..n_items]) |item| {
         if (fileSize(io, item.path) == item.f.size) {
             base += item.f.size;
             progress.done.store(base, .monotonic);
@@ -209,4 +223,27 @@ pub fn remove(gpa: std.mem.Allocator, io: Io, models_root: []const u8, m: Model)
     defer arena_state.deinit();
     const lp = try localPaths(arena_state.allocator(), models_root, m);
     try Io.Dir.cwd().deleteTree(io, lp.dir);
+}
+
+/// What a model folder holds on disk: finished files and partial downloads.
+pub const DiskFile = struct { name: []const u8, size: u64, partial: bool };
+
+pub fn diskFiles(a: std.mem.Allocator, io: Io, dir: []const u8) ![]DiskFile {
+    var out: std.ArrayList(DiskFile) = .empty;
+    var d = Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return out.items;
+    defer d.close(io);
+    var it = d.iterate();
+    while (try it.next(io)) |e| {
+        if (e.kind != .file) continue;
+        const st = d.statFile(io, e.name, .{}) catch continue;
+        try out.append(a, .{ .name = try a.dupe(u8, e.name), .size = st.size, .partial = std.mem.endsWith(u8, e.name, ".part") });
+    }
+    return out.items;
+}
+
+/// Delete unfinished downloads (*.part) in a model folder.
+pub fn removePartials(a: std.mem.Allocator, io: Io, dir: []const u8) !void {
+    for (try diskFiles(a, io, dir)) |f| if (f.partial) {
+        Io.Dir.cwd().deleteFile(io, try std.fs.path.join(a, &.{ dir, f.name })) catch {};
+    };
 }

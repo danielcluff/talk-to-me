@@ -331,4 +331,132 @@ int32_t te_synthesize(te_engine * e, const te_synth_params * sp,
     return 0;
 }
 
+// ---------------------------------------------------------------- text generation
+
+struct te_llm {
+    llama_model *             model = nullptr;
+    const llama_vocab *       vocab = nullptr;
+    common_chat_templates_ptr tmpls;
+};
+
+te_llm * te_llm_load(const char * model_path, int32_t use_gpu, char * err, size_t err_size) {
+    if (!model_path) {
+        set_err(err, err_size, "model_path is required");
+        return nullptr;
+    }
+    static bool backend_ready = false;
+    if (!backend_ready) {
+        llama_log_set(log_cb, nullptr);
+        llama_backend_init();
+        backend_ready = true;
+    }
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = use_gpu ? 999 : 0;
+    llama_model * model = llama_model_load_from_file(model_path, mp);
+    if (!model) {
+        set_err(err, err_size, "failed to load %s", model_path);
+        return nullptr;
+    }
+    auto * llm = new te_llm();
+    llm->model = model;
+    llm->vocab = llama_model_get_vocab(model);
+    try {
+        llm->tmpls = common_chat_templates_init(model, "");
+    } catch (const std::exception & ex) {
+        set_err(err, err_size, "chat template: %s", ex.what());
+        te_llm_free(llm);
+        return nullptr;
+    }
+    return llm;
+}
+
+void te_llm_free(te_llm * llm) {
+    if (!llm) return;
+    if (llm->model) llama_model_free(llm->model);
+    delete llm;
+}
+
+static void llm_batch(llama_batch_ext * batch, const llama_token * tokens, int32_t n, llama_pos pos0) {
+    llama_batch_ext_clear(batch);
+    for (int32_t i = 0; i < n; ++i) {
+        const int32_t idx = llama_batch_ext_add_token(batch, 0, tokens[i]);
+        const llama_pos pos = pos0 + i;
+        llama_batch_ext_set_pos(batch, idx, &pos);
+    }
+    llama_batch_ext_set_output_logits(batch, n - 1, true);
+}
+
+int32_t te_llm_generate(te_llm * llm, const char * user_message, int32_t max_tokens,
+                        char * out, size_t out_size, char * err, size_t err_size) {
+    if (!llm || !user_message || !out || out_size == 0) {
+        set_err(err, err_size, "bad arguments");
+        return -1;
+    }
+    out[0] = 0;
+    try {
+        common_chat_templates_inputs inputs;
+        common_chat_msg msg;
+        msg.role = "user";
+        msg.content = user_message;
+        inputs.messages.push_back(msg);
+        inputs.add_generation_prompt = true;
+        inputs.use_jinja = true;
+        inputs.enable_thinking = false; // Qwen3: answer directly
+        const std::string prompt = common_chat_templates_apply(llm->tmpls.get(), inputs).prompt.str();
+
+        std::vector<llama_token> tokens = common_tokenize(llm->vocab, prompt, true, true);
+        const int32_t n_max = max_tokens > 0 ? max_tokens : 200;
+        const int32_t n_ctx_train = llama_model_n_ctx_train(llm->model);
+        if ((int32_t) tokens.size() + n_max > n_ctx_train) {
+            set_err(err, err_size, "report too long for the model (%d tokens)", (int) tokens.size());
+            return -1;
+        }
+
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = (uint32_t) (tokens.size() + n_max + 16);
+        cp.n_batch = (uint32_t) tokens.size();
+        cp.no_perf = true;
+        llama_context * ctx = llama_init_from_model(llm->model, cp);
+        if (!ctx) {
+            set_err(err, err_size, "failed to create a context");
+            return -1;
+        }
+
+        llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(40));
+        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
+        llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.3f));
+        llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
+
+        llama_batch_ext * batch = llama_batch_ext_init(ctx);
+        llm_batch(batch, tokens.data(), (int32_t) tokens.size(), 0);
+        llama_pos pos = (llama_pos) tokens.size();
+        std::string reply;
+        int32_t rc = 0;
+        for (int32_t i = 0; i < n_max; ++i) {
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch) != 0) {
+                set_err(err, err_size, "decode failed");
+                rc = -1;
+                break;
+            }
+            const llama_token t = llama_sampler_sample(smpl, ctx, -1);
+            if (llama_vocab_is_eog(llm->vocab, t)) break;
+            reply += common_token_to_piece(llm->vocab, t, false);
+            llm_batch(batch, &t, 1, pos++);
+        }
+        llama_batch_ext_free(batch);
+        llama_sampler_free(smpl);
+        llama_free(ctx);
+        if (rc != 0) return rc;
+
+        const size_t n = std::min(reply.size(), out_size - 1);
+        memcpy(out, reply.data(), n);
+        out[n] = 0;
+        return (int32_t) n;
+    } catch (const std::exception & ex) {
+        set_err(err, err_size, "generation failed: %s", ex.what());
+        return -1;
+    }
+}
+
 } // extern "C"

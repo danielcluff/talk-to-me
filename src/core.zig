@@ -263,6 +263,10 @@ pub const Core = struct {
     brief_thread: ?std.Thread = null,
     hold: ?Hold = null,
     last_report: ?Report = null,
+    // local summary model, owned by the brief thread
+    llm: ?*c.te_llm = null,
+    llm_id: []const u8 = "",
+    llm_last_ms: i64 = 0,
 
     pub fn create(gpa: std.mem.Allocator, io: Io, paths: config.Paths, settings: config.Settings) !*Core {
         const self = try gpa.create(Core);
@@ -290,6 +294,7 @@ pub const Core = struct {
         self.mu.unlock();
         if (self.engine_thread) |t| t.join();
         if (self.brief_thread) |t| t.join();
+        if (self.llm) |l| c.te_llm_free(l);
         for (self.brief_tasks.items) |t| {
             t.arena.deinit();
             self.gpa.destroy(t);
@@ -976,6 +981,10 @@ pub const Core = struct {
             self.failLoad("unknown model");
             return;
         };
+        if (m.kind != .voice) {
+            self.failLoad("that model isn't a voice model");
+            return;
+        }
         self.load_state = .loading;
         self.engine_model = m.id;
         self.pushEvent((Event{ .kind = .model_state }).withState("loading"));
@@ -1177,7 +1186,15 @@ pub const Core = struct {
         self.mu.lock();
         while (!self.shutting_down) {
             if (self.brief_tasks.items.len == 0) {
-                self.brief_cv.wait(&self.mu);
+                // unload an idle local summary model like the voice model
+                const unload_after: i64 = @as(i64, self.settings.idle_unload_minutes) * 60_000;
+                if (self.llm != null and unload_after > 0 and monoMs() - self.llm_last_ms > unload_after) {
+                    c.te_llm_free(self.llm.?);
+                    self.llm = null;
+                    self.llm_id = "";
+                    log.info("unloaded the summary model", .{});
+                }
+                self.brief_cv.timedWait(&self.mu, 30_000);
                 continue;
             }
             const t = self.brief_tasks.orderedRemove(0);
@@ -1205,7 +1222,7 @@ pub const Core = struct {
         };
         const started = monoMs();
         var ok = true;
-        const summary = briefing.summarize(a, self.io, env, cfg, t.text) catch |err| blk: {
+        const summary = (if (cfg.backend == .local) self.summarizeLocal(a, cfg.model, t.text) else briefing.summarize(a, self.io, env, cfg, t.text)) catch |err| blk: {
             log.warn("briefing with {t} failed ({t}); reading the first paragraph instead", .{ cfg.backend, err });
             ok = false;
             break :blk briefing.firstParagraph(t.text);
@@ -1246,6 +1263,40 @@ pub const Core = struct {
         self.last_report = report;
         self.pushEvent((Event{ .kind = .briefing }).withState(if (ok) "ready" else "fallback"));
         self.mu.unlock();
+    }
+
+    /// Summarize with a downloaded summary model, in-process (brief thread).
+    fn summarizeLocal(self: *Core, a: std.mem.Allocator, id: []const u8, report: []const u8) ![]const u8 {
+        const m = self.catalog.find(id) orelse return error.UnknownSummaryModel;
+        if (m.kind != .summary) return error.NotASummaryModel;
+        const lp = try models.localPaths(a, self.paths.models, m.*);
+        if (!models.isInstalled(self.io, lp, m.*)) return error.SummaryModelNotInstalled;
+        if (self.llm == null or !std.mem.eql(u8, self.llm_id, m.id)) {
+            if (self.llm) |l| c.te_llm_free(l);
+            self.llm = null;
+            var err: [256]u8 = @splat(0);
+            self.llm = c.te_llm_load(lp.model.ptr, 1, &err, err.len) orelse {
+                log.err("summary model: {s}", .{std.mem.sliceTo(&err, 0)});
+                return error.SummaryModelLoadFailed;
+            };
+            self.llm_id = m.id;
+            log.info("loaded summary model {s}", .{m.id});
+        }
+        self.llm_last_ms = monoMs();
+        // keep the prompt well inside small models' context windows
+        const trimmed = report[0..@min(report.len, 24_000)];
+        const prompt = try briefing.buildPrompt(a, trimmed);
+        const promptZ = try a.dupeSentinel(u8, prompt, 0);
+        const out = try a.alloc(u8, 4096);
+        var err: [256]u8 = @splat(0);
+        const n = c.te_llm_generate(self.llm.?, promptZ.ptr, 160, out.ptr, out.len, &err, err.len);
+        if (n < 0) {
+            log.err("summary model: {s}", .{std.mem.sliceTo(&err, 0)});
+            return error.SummaryFailed;
+        }
+        const cleaned = try briefing.clean(a, out[0..@intCast(n)]);
+        if (cleaned.len == 0) return error.EmptySummary;
+        return cleaned;
     }
 
     /// Release the held queue (caller holds mu).
@@ -1434,13 +1485,19 @@ pub const Core = struct {
 
     pub const ModelView = struct {
         id: []const u8,
+        kind: models.Kind,
         name: []const u8,
         description: []const u8,
         recommended: bool,
         size: u64,
         installed: bool,
+        /// in use for its kind: the voice model, the briefing summarizer, the recognizer
         active: bool,
         loaded: bool,
+        dir: []const u8,
+        disk_bytes: u64,
+        partial_bytes: u64,
+        files: []const models.DiskFile,
         download: ?struct { done: u64, total: u64, active: bool, @"error": []const u8 } = null,
     };
 
@@ -1450,15 +1507,33 @@ pub const Core = struct {
         defer self.mu.unlock();
         for (self.catalog.all()) |m| {
             const lp = try models.localPaths(a, self.paths.models, m);
+            const files = try models.diskFiles(a, self.io, lp.dir);
+            var disk: u64 = 0;
+            var partial: u64 = 0;
+            for (files) |f| {
+                disk += f.size;
+                if (f.partial) partial += f.size;
+            }
+            const b = self.settings.briefing;
+            const active = switch (m.kind) {
+                .voice => std.mem.eql(u8, m.id, self.settings.model),
+                .summary => b.backend == .local and std.mem.eql(u8, m.id, b.model),
+                .listening => std.mem.eql(u8, m.id, b.recognizer),
+            };
             var v: ModelView = .{
                 .id = m.id,
+                .kind = m.kind,
                 .name = m.name,
                 .description = m.description,
                 .recommended = m.recommended,
                 .size = m.totalSize(),
                 .installed = models.isInstalled(self.io, lp, m),
-                .active = std.mem.eql(u8, m.id, self.settings.model),
-                .loaded = self.load_state == .loaded and std.mem.eql(u8, m.id, self.engine_model),
+                .active = active,
+                .loaded = (self.load_state == .loaded and std.mem.eql(u8, m.id, self.engine_model)) or std.mem.eql(u8, m.id, self.llm_id),
+                .dir = lp.dir,
+                .disk_bytes = disk,
+                .partial_bytes = partial,
+                .files = files,
             };
             if (std.mem.eql(u8, m.id, self.download_model)) {
                 v.download = .{

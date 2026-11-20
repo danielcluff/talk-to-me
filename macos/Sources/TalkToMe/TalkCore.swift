@@ -25,8 +25,19 @@ struct DownloadState: Decodable, Equatable {
     var error: String
 }
 
+struct DiskFile: Decodable, Equatable, Hashable {
+    var name: String
+    var size: Int64
+    var partial: Bool
+}
+
 struct ModelInfo: Decodable, Identifiable, Equatable {
     var id: String
+    var kind: String = "voice"
+    var dir: String = ""
+    var disk_bytes: Int64 = 0
+    var partial_bytes: Int64 = 0
+    var files: [DiskFile] = []
     var name: String
     var description: String
     var recommended: Bool
@@ -172,8 +183,8 @@ final class TalkCore: ObservableObject {
 
     private var downloadPoll: Timer?
 
-    var hasInstalledModel: Bool { models.contains { $0.installed } }
-    var activeModel: ModelInfo? { models.first { $0.active } }
+    var hasInstalledModel: Bool { models.contains { $0.installed && $0.kind == "voice" } }
+    var activeModel: ModelInfo? { models.first { $0.active && $0.kind == "voice" } }
     var isSpeaking: Bool { player.state == "playing" }
 
     func start() {
@@ -376,7 +387,15 @@ final class TalkCore: ObservableObject {
 
     func download(_ id: String) { Task { await send("POST", "/v1/models/\(id)/download"); await refreshModels() } }
     func cancelDownload(_ id: String) { Task { await send("POST", "/v1/models/\(id)/cancel") } }
-    func deleteModel(_ id: String) { Task { await send("DELETE", "/v1/models/\(id)"); await refreshModels() } }
+    func deleteModel(_ id: String) {
+        Task {
+            await send("DELETE", "/v1/models/\(id)")
+            await refreshModels()
+            await refreshSettings()
+        }
+    }
+
+    func cleanPartials(_ id: String) { Task { await send("POST", "/v1/models/\(id)/clean"); await refreshModels() } }
 
     func activate(_ id: String) {
         Task {

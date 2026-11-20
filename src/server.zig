@@ -465,14 +465,57 @@ fn modelRoute(s: *Server, req: *Exchange, a: std.mem.Allocator, method: http.Met
         s.core.cancelDownload();
         return sendJson(req, a, .ok, .{ .ok = true });
     }
+    if (method == .POST and std.mem.eql(u8, action, "clean")) {
+        @import("models/models.zig").removePartials(a, s.io, try std.fs.path.join(a, &.{ s.paths.models, m.id })) catch {};
+        return sendJson(req, a, .ok, .{ .ok = true });
+    }
     if (method == .POST and std.mem.eql(u8, action, "activate")) {
         var settings = try s.core.getSettings(a);
+        switch (m.kind) {
+            .summary => {
+                settings.briefing.backend = .local;
+                settings.briefing.model = m.id;
+                s.core.setSettings(settings) catch |err| return sendError(req, a, .internal_server_error, @errorName(err));
+                return sendJson(req, a, .ok, .{ .ok = true, .model = m.id, .used_for = "briefing" });
+            },
+            .listening => {
+                settings.briefing.recognizer = m.id;
+                s.core.setSettings(settings) catch |err| return sendError(req, a, .internal_server_error, @errorName(err));
+                return sendJson(req, a, .ok, .{ .ok = true, .model = m.id, .used_for = "listening" });
+            },
+            .voice => {},
+        }
         if (!std.mem.eql(u8, m.id, settings.model)) settings.voice = "";
         settings.model = m.id;
         s.core.setSettings(settings) catch |err| return sendError(req, a, .internal_server_error, @errorName(err));
         return sendJson(req, a, .ok, .{ .ok = true, .model = m.id });
     }
     if (method == .DELETE and action.len == 0) {
+        // deleting what's in use switches to something safe first
+        var settings = try s.core.getSettings(a);
+        var changed = false;
+        switch (m.kind) {
+            .voice => if (std.mem.eql(u8, settings.model, m.id)) {
+                const views = try s.core.modelViews(a);
+                for (views) |v| if (v.kind == .voice and v.installed and !std.mem.eql(u8, v.id, m.id)) {
+                    settings.model = v.id;
+                    settings.voice = "";
+                    changed = true;
+                    break;
+                };
+            },
+            // never fall back to a cloud summarizer the person didn't pick
+            .summary => if (settings.briefing.backend == .local and std.mem.eql(u8, settings.briefing.model, m.id)) {
+                settings.briefing.enabled = false;
+                settings.briefing.model = "";
+                changed = true;
+            },
+            .listening => if (std.mem.eql(u8, settings.briefing.recognizer, m.id)) {
+                settings.briefing.recognizer = "apple";
+                changed = true;
+            },
+        }
+        if (changed) s.core.setSettings(settings) catch {};
         @import("models/models.zig").remove(s.gpa, s.io, s.paths.models, m.*) catch |err|
             return sendError(req, a, .internal_server_error, @errorName(err));
         s.core.resetLoadFailure();
@@ -523,7 +566,8 @@ fn patchSettings(s: *Server, req: *Exchange, a: std.mem.Allocator) !void {
         return sendError(req, a, .bad_request, "invalid settings (unknown key or bad value)");
     var settings = try s.core.getSettings(a);
     if (patch.model) |m| {
-        if (s.core.catalog.find(m) == null) return sendError(req, a, .bad_request, "unknown model");
+        const found = s.core.catalog.find(m) orelse return sendError(req, a, .bad_request, "unknown model");
+        if (found.kind != .voice) return sendError(req, a, .bad_request, "that isn't a voice model");
         if (!std.mem.eql(u8, m, settings.model)) settings.voice = "";
         settings.model = m;
     }

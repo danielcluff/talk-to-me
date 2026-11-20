@@ -509,8 +509,12 @@ fn modelsCmd(ctx: *Ctx, rest: []const []const u8) !void {
             }
         }
     } else if (eql(sub, "use")) {
-        _ = try request(ctx, .POST, try std.fmt.allocPrint(ctx.arena, "/v1/models/{s}/activate", .{id}), "{}");
-        return outf(ctx, "active model: {s}\n", .{id});
+        const body = try request(ctx, .POST, try std.fmt.allocPrint(ctx.arena, "/v1/models/{s}/activate", .{id}), "{}");
+        const U = struct { used_for: []const u8 = "voice" };
+        const u = std.json.parseFromSliceLeaky(U, ctx.arena, body, .{ .ignore_unknown_fields = true }) catch U{};
+        if (eql(u.used_for, "briefing")) return outf(ctx, "briefings now summarize with {s} (local)\n", .{id});
+        if (eql(u.used_for, "listening")) return outf(ctx, "answers are now recognized with {s}\n", .{id});
+        return outf(ctx, "active voice model: {s}\n", .{id});
     } else if (eql(sub, "remove")) {
         _ = try request(ctx, .DELETE, try std.fmt.allocPrint(ctx.arena, "/v1/models/{s}", .{id}), null);
         return outf(ctx, "removed {s}\n", .{id});

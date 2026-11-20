@@ -244,20 +244,27 @@ struct ModelsPage: View {
     @EnvironmentObject var core: TalkCore
     @State private var confirmDelete: ModelInfo?
 
+    private let groups: [(kind: String, title: String, detail: String)] = [
+        ("voice", "Voices", "The voice that reads to you. One is in use at a time."),
+        ("summary", "Summaries", "Optional. Local models for Briefing, if you'd rather not use Codex, Claude Code or OpenCode. Loaded only while summarizing."),
+        ("listening", "Listening", "Optional. Local speech recognition for answering briefings. Apple's built-in recognizer needs no download."),
+    ]
+
     var body: some View {
-        PageHeader(title: "Models", subtitle: "Voice models run on this Mac. Nothing is downloaded until you choose to.")
-        ForEach(core.models) { m in
-            Card {
-                HStack(alignment: .firstTextBaseline) {
-                    Text(m.name).font(.title3.weight(.semibold))
-                    if m.recommended { Badge(text: "Recommended") }
-                    if m.active { Badge(text: "Active", color: .green) }
-                    Spacer()
-                    Text(megabytes(m.size)).foregroundStyle(.secondary).monospacedDigit()
+        PageHeader(title: "Models", subtitle: "Models run on this Mac. Nothing is downloaded until you choose to.")
+        ForEach(groups, id: \.kind) { g in
+            SectionTitle(text: g.title)
+            Text(g.detail).font(.callout).foregroundStyle(.secondary)
+            ForEach(core.models.filter { $0.kind == g.kind }) { m in card(m) }
+        }
+        let total = core.models.reduce(Int64(0)) { $0 + $1.disk_bytes }
+        HStack {
+            Text("Models use \(megabytes(total)) on disk.").foregroundStyle(.secondary)
+            Spacer()
+            if let root = core.models.first?.dir {
+                Button("Show Models Folder") {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: root).deletingLastPathComponent())
                 }
-                Text(m.description).foregroundStyle(.secondary)
-                Text("English").font(.caption).foregroundStyle(.secondary)
-                actions(m)
             }
         }
         if let err = core.lastError {
@@ -266,10 +273,66 @@ struct ModelsPage: View {
         Spacer()
             .alert(item: $confirmDelete) { m in
                 Alert(title: Text("Delete \(m.name)?"),
-                      message: Text("This removes \(megabytes(m.size)) of model files. You can download it again later."),
+                      message: Text(deleteMessage(m)),
                       primaryButton: .destructive(Text("Delete")) { core.deleteModel(m.id) },
                       secondaryButton: .cancel())
             }
+    }
+
+    private func deleteMessage(_ m: ModelInfo) -> String {
+        var msg = "This removes \(megabytes(max(m.disk_bytes, m.size))) of files from \(m.dir). You can download it again later."
+        if m.active {
+            switch m.kind {
+            case "voice": msg += " It's the voice in use; Talk to Me switches to another installed voice."
+            case "summary": msg += " It's your briefing summarizer; briefings are turned off."
+            default: msg += " It's your recognizer; answering switches to Apple's."
+            }
+        }
+        return msg
+    }
+
+    private func useLabel(_ m: ModelInfo) -> String {
+        switch m.kind {
+        case "summary": return "Use for Briefings"
+        case "listening": return "Use for Listening"
+        default: return "Use This Voice"
+        }
+    }
+
+    private func card(_ m: ModelInfo) -> some View {
+        Card {
+            HStack(alignment: .firstTextBaseline) {
+                Text(m.name).font(.title3.weight(.semibold))
+                if m.recommended { Badge(text: "Recommended") }
+                if m.active { Badge(text: "In use", color: .green) }
+                Spacer()
+                Text(megabytes(m.size)).foregroundStyle(.secondary).monospacedDigit()
+            }
+            Text(m.description).foregroundStyle(.secondary)
+            actions(m)
+            if m.installed || m.disk_bytes > 0 {
+                Divider()
+                HStack(alignment: .firstTextBaseline) {
+                    Image(systemName: "folder").foregroundStyle(.secondary)
+                    Text(m.dir).font(.caption.monospaced()).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle)
+                    Spacer()
+                    Text("\(megabytes(m.disk_bytes)) on disk").font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                    Button("Show in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: m.dir)])
+                    }
+                    .controlSize(.small)
+                }
+                if m.partial_bytes > 0 && m.download?.active != true {
+                    HStack {
+                        Label("Unfinished download: \(megabytes(m.partial_bytes))", systemImage: "exclamationmark.triangle")
+                            .font(.caption).foregroundStyle(.orange)
+                        Spacer()
+                        Button("Remove") { core.cleanPartials(m.id) }.controlSize(.small)
+                    }
+                }
+            }
+        }
     }
 
     @ViewBuilder private func actions(_ m: ModelInfo) -> some View {
@@ -281,10 +344,8 @@ struct ModelsPage: View {
             }
         } else if m.installed {
             HStack {
-                if m.active {
-                    Label("In use", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
-                } else {
-                    Button("Use This Model") { core.activate(m.id) }
+                if !m.active {
+                    Button(useLabel(m)) { core.activate(m.id) }
                 }
                 Spacer()
                 Button("Delete…", role: .destructive) { confirmDelete = m }
@@ -517,6 +578,7 @@ struct BriefingPage: View {
         ("claude", "Claude Code", "e.g. haiku or sonnet. Empty uses your Claude Code default.", "Anthropic"),
         ("opencode", "OpenCode", "provider/model, e.g. ollama/qwen2.5-coder:7b. Empty uses your OpenCode default.", "your OpenCode provider"),
         ("ollama", "Ollama", "a model you've pulled, e.g. qwen3:4b.", nil),
+        ("local", "Local model", "a summary model downloaded on the Models page.", nil),
     ]
 
     var body: some View {
@@ -545,10 +607,25 @@ struct BriefingPage: View {
             }
             .pickerStyle(.segmented)
             let current = backends.first { $0.id == b.backend } ?? backends[0]
-            HStack {
-                TextField("Model", text: $model)
-                    .onSubmit { core.updateBriefing(["model": model]) }
-                Button("Save") { core.updateBriefing(["model": model]) }
+            if b.backend == "local" {
+                let installed = core.models.filter { $0.kind == "summary" && $0.installed }
+                if installed.isEmpty {
+                    HStack {
+                        Text("No summary model downloaded yet.").foregroundStyle(.secondary)
+                        Button("Go to Models") { SettingsWindow.shared.show(.models) }
+                    }
+                } else {
+                    Picker("Model", selection: Binding(get: { b.model }, set: { core.updateBriefing(["model": $0]) })) {
+                        if !installed.contains(where: { $0.id == b.model }) { Text("Choose a model").tag(b.model) }
+                        ForEach(installed) { Text($0.name).tag($0.id) }
+                    }
+                }
+            } else {
+                HStack {
+                    TextField("Model", text: $model)
+                        .onSubmit { core.updateBriefing(["model": model]) }
+                    Button("Save") { core.updateBriefing(["model": model]) }
+                }
             }
             Text(current.hint).font(.callout).foregroundStyle(.secondary)
             if b.backend == "ollama" {
@@ -561,7 +638,6 @@ struct BriefingPage: View {
                 Label("Reports stay on this Mac.", systemImage: "lock")
                     .font(.callout).foregroundStyle(.green)
             }
-            Text("Local models running inside Talk to Me are coming next.").font(.callout).foregroundStyle(.secondary)
             HStack {
                 Stepper("Brief replies longer than \(b.min_words) words", value: Binding(get: { b.min_words }, set: { core.updateBriefing(["min_words": $0]) }), in: 20...400, step: 10)
             }

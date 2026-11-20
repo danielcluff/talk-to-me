@@ -63,6 +63,20 @@ int32_t      te_synthesize(te_engine * engine, const te_synth_params * params,
                            te_audio_cb cb, void * user, te_timings * timings,
                            char * err, size_t err_size);
 
+// ---------------------------------------------------------------- text generation
+// A small instruct model for summaries (briefings). One user message in, the
+// assistant's reply out, with the model's chat template and thinking off.
+
+typedef struct te_llm te_llm;
+
+te_llm *     te_llm_load(const char * model_path, int32_t use_gpu, char * err, size_t err_size);
+void         te_llm_free(te_llm * llm);
+
+// Returns the reply length written to `out` (NUL terminated, truncated to
+// out_size), or -1 on error (message in err).
+int32_t      te_llm_generate(te_llm * llm, const char * user_message, int32_t max_tokens,
+                             char * out, size_t out_size, char * err, size_t err_size);
+
 #ifdef __cplusplus
 }
 #endif

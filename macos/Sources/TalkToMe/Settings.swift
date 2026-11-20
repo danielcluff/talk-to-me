@@ -79,15 +79,22 @@ struct SettingsView: View {
     @EnvironmentObject var selection: PageSelection
 
     var body: some View {
-        NavigationSplitView {
+        // A fixed sidebar and a subtle line instead of NavigationSplitView,
+        // whose divider is high-contrast and can be dragged.
+        HStack(spacing: 0) {
             List(SettingsPage.allCases, selection: Binding(get: { selection.page }, set: { if let p = $0 { selection.page = p } })) { page in
                 Label(page.title, systemImage: page.icon)
                     .tag(page)
                     .padding(.vertical, 3)
             }
-            .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 240)
-            .toolbar(removing: .sidebarToggle) // the page list always stays visible
-        } detail: {
+            .listStyle(.sidebar)
+            .frame(width: 210)
+
+            Rectangle()
+                .fill(Color.primary.opacity(0.07))
+                .frame(width: 1)
+                .ignoresSafeArea()
+
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     switch selection.page {
@@ -107,7 +114,7 @@ struct SettingsView: View {
                 .frame(maxWidth: 760, alignment: .leading)
                 .frame(maxWidth: .infinity)
             }
-            .navigationTitle(selection.page.title)
+            .frame(maxWidth: .infinity)
         }
         .task { await core.refreshAll() }
     }

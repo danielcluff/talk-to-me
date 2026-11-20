@@ -7,6 +7,7 @@
 //! Hooks never fail the agent: errors go to stderr and the exit code is 0.
 
 const std = @import("std");
+const title_turn = @import("text/title_turn.zig");
 const Io = std.Io;
 const main = @import("main.zig");
 const Ctx = main.Ctx;
@@ -165,8 +166,11 @@ fn hookCodex(ctx: *Ctx, args: []const []const u8) !void {
     };
     const in = try std.json.parseFromSliceLeaky(In, ctx.arena, json, .{ .ignore_unknown_fields = true });
     if (!main.eql(in.type, "agent-turn-complete")) return;
-    try speakReply(ctx, "codex", in.cwd, in.@"thread-id", in.@"last-assistant-message" orelse "");
+    const msg = in.@"last-assistant-message" orelse "";
+    if (title_turn.isTitleTurn(ctx.arena, msg)) return;
+    try speakReply(ctx, "codex", in.cwd, in.@"thread-id", msg);
 }
+
 
 fn hookOpencode(ctx: *Ctx) !void {
     const In = struct { session_id: []const u8 = "", cwd: []const u8 = "", text: []const u8 = "" };

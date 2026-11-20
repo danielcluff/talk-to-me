@@ -3,4 +3,5 @@ test {
     _ = @import("text/chunk.zig");
     _ = @import("text/dictionary.zig");
     _ = @import("briefing.zig");
+    _ = @import("text/title_turn.zig");
 }

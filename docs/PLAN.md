@@ -738,10 +738,17 @@ Verified, against a fake HOME and a test server:
 - **Per-source settings:** Codex announce plus voice worked, and muted OpenCode
   was dropped.
 
-Not done:
-- Nothing has been installed into the real agent configs. That's your choice,
-  from Settings → Sources or `talktome install …`.
-- A live end-to-end run inside each real agent.
+Installed for real (2026-11-19), with the app's bundled CLI (the same
+command the Sources page's Install button runs), after linking
+`~/.local/bin/talktome`:
+- Claude Code plugin: the hook and MCP point at `~/.local/bin/talktome`. A
+  live hook through the installed plugin spoke.
+- Codex: `notify` chains the Computer Use client. A backup is at
+  `~/.codex/config.toml.talktome-backup`.
+- OpenCode plugin and herdr mod are installed. herdr wasn't running, so the
+  mod hasn't been seen live yet.
+
+Still to check: a real turn in each agent (new sessions load the plugins).
 
 **Phase 5: browser**
 - Fork the extension, add pairing, SSE highlighting, and ChatGPT and Claude

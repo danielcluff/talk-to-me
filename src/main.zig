@@ -43,6 +43,7 @@ pub const usage =
     \\  skip                 skip to the next queued item
     \\  status               player state
     \\  jobs                 current, queued and recent jobs
+    \\  history clear        forget the saved history (~/Library/Application Support/TalkToMe/history.json)
     \\  voices               voices of the active model
     \\  models               list models
     \\  models download ID   download a model (e.g. kokoro)
@@ -122,6 +123,11 @@ fn run(init: std.process.Init) !void {
         return printPlayer(&ctx, try request(&ctx, .GET, "/v1/player", null));
     }
     if (eql(cmd, "jobs")) return jobs(&ctx);
+    if (eql(cmd, "history") and rest.len == 1 and eql(rest[0], "clear")) {
+        try ensureServer(&ctx);
+        _ = try request(&ctx, .DELETE, "/v1/history", null);
+        return out(io, "history cleared\n");
+    }
     if (eql(cmd, "voices")) return voices(&ctx);
     if (eql(cmd, "models")) return modelsCmd(&ctx, rest);
     if (eql(cmd, "config")) return configCmd(&ctx, rest);

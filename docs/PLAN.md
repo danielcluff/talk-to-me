@@ -879,6 +879,15 @@ History:
 - `POST /v1/jobs/{id}/replay` reads it again, labeled "Codex · redshift" and
   in that source's voice.
 - Settings has a History page with relative times, Replay and Copy.
+- (2026-11-20) **History persists** in
+  `~/Library/Application Support/TalkToMe/history.json`, as text only, never
+  audio, oldest first, the last 50 items.
+  - The audio thread only marks History as changed; the engine thread writes
+    the file after attaching texts. It writes to a temporary file and renames
+    it.
+  - Loading restores the ring and continues job IDs after the saved ones.
+  - **Clear History…** (with confirmation), `DELETE /v1/history` and
+    `talktome history clear` empty it in memory and on disk.
 
 Fixes:
 - `speak()` now deep-copies settings into the job arena. Before, a settings

@@ -268,6 +268,10 @@ pub fn dispatch(s: *Server, ex: *Exchange, a: std.mem.Allocator, method: http.Me
     if (method == .POST and std.mem.eql(u8, path, "/v1/speak")) return speak(s, req, a);
     if (method == .POST and std.mem.eql(u8, path, "/v1/speak/file")) return speakFile(s, req, a);
     if (method == .GET and std.mem.eql(u8, path, "/v1/jobs")) return sendJson(req, a, .ok, .{ .jobs = try s.core.jobViews(a) });
+    if (method == .DELETE and std.mem.eql(u8, path, "/v1/history")) {
+        s.core.clearHistory() catch |err| return sendError(req, a, .internal_server_error, @errorName(err));
+        return sendJson(req, a, .ok, .{ .ok = true });
+    }
     if (std.mem.startsWith(u8, path, "/v1/jobs/") and (method == .GET or method == .POST)) return jobRoute(s, req, a, method, path["/v1/jobs/".len..]);
     if (method == .DELETE and std.mem.startsWith(u8, path, "/v1/jobs/")) {
         const id = parseJobId(path["/v1/jobs/".len..]) orelse return sendError(req, a, .bad_request, "bad job id");

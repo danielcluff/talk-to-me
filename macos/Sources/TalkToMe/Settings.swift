@@ -771,6 +771,7 @@ struct DictionaryPage: View {
 
 struct HistoryPage: View {
     @EnvironmentObject var core: TalkCore
+    @State private var confirmClear = false
 
     private var items: [JobInfo] {
         core.jobs.filter { $0.state != "queued" && $0.state != "playing" }
@@ -782,7 +783,18 @@ struct HistoryPage: View {
     }
 
     @ViewBuilder private var content: some View {
-        PageHeader(title: "History", subtitle: "The last 50 things Talk to Me read. Replay one or copy its text.")
+        HStack(alignment: .top) {
+            PageHeader(title: "History", subtitle: "The last 50 things Talk to Me read, kept as text (no audio) across restarts. Replay one or copy its text.")
+            Spacer()
+            Button("Clear History…", role: .destructive) { confirmClear = true }
+                .disabled(items.isEmpty)
+        }
+        .alert("Clear history?", isPresented: $confirmClear) {
+            Button("Clear", role: .destructive) { core.clearHistory() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This permanently deletes the text of all \(items.count) items. It can't be undone.")
+        }
         if items.isEmpty {
             Text("Nothing yet.").foregroundStyle(.secondary)
         } else {

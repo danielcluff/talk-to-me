@@ -225,6 +225,8 @@ pub const Core = struct {
     history: [history_len]Summary = undefined,
     history_text: [history_len]?HistoryText = @splat(null),
     history_count: usize = 0,
+    /// set when history changes (also on the audio thread); the engine thread saves it
+    history_dirty: bool = false,
     history_head: usize = 0,
 
     // events, guarded by mu
@@ -285,6 +287,7 @@ pub const Core = struct {
         };
         self.settings = try dupeSettings(self.settings_arena.allocator(), settings);
         self.last_active_ms = self.nowMs();
+        self.loadHistory() catch |err| log.warn("history.json could not be read ({t}); starting empty", .{err});
         self.engine_thread = try std.Thread.spawn(.{}, engineMain, .{self});
         self.brief_thread = try std.Thread.spawn(.{}, briefMain, .{self});
         return self;
@@ -490,6 +493,108 @@ pub const Core = struct {
         self.history[self.history_head] = sum;
         self.history_head = (self.history_head + 1) % history_len;
         if (self.history_count < history_len) self.history_count += 1;
+        self.history_dirty = true;
+    }
+
+    // ------------------------------------------------------------ persistent history
+
+    /// One saved history item (history.json holds them oldest first).
+    const SavedItem = struct {
+        id: u64,
+        app: []const u8,
+        label: []const u8,
+        preview: []const u8,
+        chunks: u32,
+        state: JobState,
+        finished_ms: i64,
+        text: []const u8,
+    };
+
+    fn historyPath(self: *Core, a: std.mem.Allocator) ![]const u8 {
+        return std.fs.path.join(a, &.{ self.paths.root, "history.json" });
+    }
+
+    fn loadHistory(self: *Core) !void {
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const data = Io.Dir.cwd().readFileAlloc(self.io, try self.historyPath(a), a, .limited(32 << 20)) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        const items = try std.json.parseFromSliceLeaky([]SavedItem, a, data, .{ .ignore_unknown_fields = true });
+        // keep the newest history_len, oldest first
+        const keep = items[items.len -| history_len ..];
+        for (keep) |it| {
+            var sum: Summary = .{ .id = it.id, .chunks = it.chunks, .state = it.state, .finished_ms = it.finished_ms };
+            copyTrunc(&sum.app, it.app);
+            copyTrunc(&sum.label, it.label);
+            copyTrunc(&sum.preview, it.preview);
+            const slot = self.history_head;
+            self.history[slot] = sum;
+            if (self.history_text[slot]) |old| self.gpa.free(old.text);
+            self.history_text[slot] = if (it.text.len > 0) .{ .id = it.id, .text = try self.gpa.dupe(u8, it.text) } else null;
+            self.history_head = (self.history_head + 1) % history_len;
+            if (self.history_count < history_len) self.history_count += 1;
+            if (it.id >= self.next_id) self.next_id = it.id + 1;
+        }
+    }
+
+    /// Snapshot history (caller holds mu), oldest first.
+    fn snapshotHistory(self: *Core, a: std.mem.Allocator) ![]SavedItem {
+        const out = try a.alloc(SavedItem, self.history_count);
+        for (out, 0..) |*o, k| {
+            const idx = (self.history_head + history_len - self.history_count + k) % history_len;
+            const sum = &self.history[idx];
+            o.* = .{
+                .id = sum.id,
+                .app = try a.dupe(u8, Summary.str(&sum.app)),
+                .label = try a.dupe(u8, Summary.str(&sum.label)),
+                .preview = try a.dupe(u8, Summary.str(&sum.preview)),
+                .chunks = sum.chunks,
+                .state = sum.state,
+                .finished_ms = sum.finished_ms,
+                .text = if (self.historyTextFor(sum.id)) |t| try a.dupe(u8, t) else "",
+            };
+        }
+        return out;
+    }
+
+    fn writeHistory(self: *Core, a: std.mem.Allocator, items: []const SavedItem) !void {
+        const path = try self.historyPath(a);
+        try Io.Dir.cwd().createDirPath(self.io, self.paths.root);
+        const json = try std.json.Stringify.valueAlloc(a, items, .{});
+        const tmp = try std.fmt.allocPrint(a, "{s}.tmp", .{path});
+        try Io.Dir.cwd().writeFile(self.io, .{ .sub_path = tmp, .data = json });
+        try Io.Dir.rename(.cwd(), tmp, .cwd(), path, self.io);
+    }
+
+    /// Engine thread: save history if it changed (called with mu held; writes without it).
+    fn saveHistoryIfDirty(self: *Core) void {
+        if (!self.history_dirty) return;
+        self.history_dirty = false;
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        const items = self.snapshotHistory(arena.allocator()) catch return;
+        self.mu.unlock();
+        defer self.mu.lock();
+        self.writeHistory(arena.allocator(), items) catch |err| log.warn("could not save history.json: {t}", .{err});
+    }
+
+    /// Forget every history item, in memory and on disk.
+    pub fn clearHistory(self: *Core) !void {
+        self.mu.lock();
+        self.history_count = 0;
+        self.history_head = 0;
+        for (&self.history_text) |*t| {
+            if (t.*) |h| self.gpa.free(h.text);
+            t.* = null;
+        }
+        self.history_dirty = false;
+        self.mu.unlock();
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        try self.writeHistory(arena.allocator(), &.{});
     }
 
     /// Retire a job (caller holds mu). The engine thread frees it later.
@@ -878,6 +983,8 @@ pub const Core = struct {
             // free retired jobs (only this thread frees jobs, never mid-synthesis)
             for (self.graveyard.items) |j| self.freeJob(j);
             self.graveyard.clearRetainingCapacity();
+            // after freeJob attached the texts
+            self.saveHistoryIfDirty();
             _ = scratch.reset(.retain_capacity);
 
             if (self.hold) |h| if (monoMs() >= h.deadline_ms) {

@@ -465,6 +465,8 @@ final class TalkCore: ObservableObject {
         update(["sources": [app: patch]])
     }
 
+    func clearHistory() { Task { await send("DELETE", "/v1/history"); await refreshJobs() } }
+
     func replay(_ id: Int) { Task { await send("POST", "/v1/jobs/\(id)/replay") } }
 
     func copyText(_ id: Int) {

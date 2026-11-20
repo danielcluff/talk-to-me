@@ -86,6 +86,13 @@ pub fn build(b: *std.Build) void {
     main_mod.addImport("c", c_mod);
     const talktome_bin = appleLink(b, "talktome", main_mod, engine_lib, &cmake_build.step);
     b.getInstallStep().dependOn(&b.addInstallBinFile(talktome_bin, "talktome").step);
+    // agent integration files, found by `talktome install` next to the binary
+    b.getInstallStep().dependOn(&b.addInstallDirectory(.{
+        .source_dir = b.path("integrations"),
+        .install_dir = .{ .custom = "share/talk-to-me" },
+        .install_subdir = "integrations",
+    }).step);
+
     // precompiled Metal shaders, found next to the binary (the app ships them in Resources)
     for ([_][]const u8{ "default.metallib", "ggml-tensor.metallib" }) |lib| {
         const inst = b.addInstallBinFile(b.path(b.fmt("{s}/bin/{s}", .{ engine_build_dir, lib })), lib);

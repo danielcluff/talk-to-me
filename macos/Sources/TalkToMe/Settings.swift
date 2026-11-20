@@ -4,7 +4,7 @@ import ServiceManagement
 import SwiftUI
 
 enum SettingsPage: String, CaseIterable, Identifiable {
-    case general, models, voices, shortcuts, permissions, about
+    case general, models, voices, sources, shortcuts, permissions, about
     var id: String { rawValue }
 
     var title: String {
@@ -12,6 +12,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .general: "General"
         case .models: "Models"
         case .voices: "Voices"
+        case .sources: "Sources"
         case .shortcuts: "Shortcuts"
         case .permissions: "Permissions"
         case .about: "About"
@@ -23,6 +24,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .general: "gearshape"
         case .models: "cpu"
         case .voices: "person.wave.2"
+        case .sources: "app.connected.to.app.below.fill"
         case .shortcuts: "keyboard"
         case .permissions: "lock.shield"
         case .about: "info.circle"
@@ -86,6 +88,7 @@ struct SettingsView: View {
                     case .general: GeneralPage()
                     case .models: ModelsPage()
                     case .voices: VoicesPage()
+                    case .sources: SourcesPage()
                     case .shortcuts: ShortcutsPage()
                     case .permissions: PermissionsPage()
                     case .about: AboutPage()
@@ -363,6 +366,62 @@ struct VoicesPage: View {
         .contentShape(Rectangle())
         .onTapGesture { core.update(["voice": v.name]) }
         .help(v.default ? "Default voice" : "Click to make this the default")
+    }
+}
+
+// MARK: - Sources
+
+struct SourcesPage: View {
+    @EnvironmentObject var core: TalkCore
+
+    var body: some View {
+        Group { content }
+            .task {
+                await core.refreshIntegrations()
+                if core.voices.isEmpty { await core.refreshVoices() }
+            }
+    }
+
+    @ViewBuilder private var content: some View {
+        PageHeader(title: "Sources", subtitle: "Agents that speak their replies. Give each its own voice to tell them apart by ear.")
+        ForEach(Integration.all) { i in card(i) }
+        if let msg = core.integrationMessage {
+            Text(msg).font(.callout).foregroundStyle(.secondary)
+        }
+        Text("Install writes to the agent's own config (Codex keeps a backup of config.toml). Restart open agent sessions afterwards.")
+            .font(.callout).foregroundStyle(.secondary)
+    }
+
+    private func card(_ i: Integration) -> some View {
+        let status = core.integrations[i.target]
+        let src = core.source(i.app)
+        return Card {
+            HStack(alignment: .firstTextBaseline) {
+                Text(i.name).font(.title3.weight(.semibold))
+                if status?.installed == true { Badge(text: "Installed", color: .green) }
+                Spacer()
+                if status?.installed == true {
+                    Button("Remove") { core.setIntegration(i, installed: false) }
+                } else if status?.present == false {
+                    Text("Not found on this Mac").foregroundStyle(.secondary)
+                } else {
+                    Button("Install") { core.setIntegration(i, installed: true) }
+                        .buttonStyle(.borderedProminent)
+                }
+            }
+            Text(i.detail).foregroundStyle(.secondary)
+            Divider()
+            Toggle("Read its replies aloud", isOn: Binding(get: { src.enabled }, set: { core.updateSource(i.app, ["enabled": $0]) }))
+            Toggle("Say its name first (\u{201C}\(i.name.components(separatedBy: " ").first ?? i.name), in my-project.\u{201D})",
+                   isOn: Binding(get: { src.announce }, set: { core.updateSource(i.app, ["announce": $0]) }))
+            Picker("Voice", selection: Binding(get: { src.voice }, set: { core.updateSource(i.app, ["voice": $0]) })) {
+                Text("Default voice").tag("")
+                ForEach(core.voices) { v in
+                    Text("\(v.displayName) (\(v.accent) \(v.gender))").tag(v.name)
+                }
+            }
+            .disabled(!src.enabled)
+        }
     }
 }
 

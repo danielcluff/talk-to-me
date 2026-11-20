@@ -11,6 +11,7 @@ const Io = std.Io;
 const config = @import("config.zig");
 const Core = @import("core.zig").Core;
 const server = @import("server.zig");
+const integrations = @import("integrations.zig");
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -49,6 +50,13 @@ pub const usage =
     \\  models remove ID     delete a model's files
     \\  config               show settings
     \\  config set KEY VALUE set a setting (voice, speed, model, ...)
+    \\
+    \\Agents:
+    \\  install TARGET       claude | codex | opencode | herdr
+    \\  uninstall TARGET
+    \\  integrations [--json] what is installed
+    \\  hook claude|codex|opencode   (called by the agents' hooks)
+    \\  mcp [--app NAME]     MCP server on stdio (speak, stop, list_voices)
     \\  help
     \\
 ;
@@ -112,6 +120,11 @@ fn run(init: std.process.Init) !void {
     if (eql(cmd, "voices")) return voices(&ctx);
     if (eql(cmd, "models")) return modelsCmd(&ctx, rest);
     if (eql(cmd, "config")) return configCmd(&ctx, rest);
+    if (eql(cmd, "hook")) return integrations.hook(&ctx, rest);
+    if (eql(cmd, "mcp")) return integrations.mcp(&ctx, rest);
+    if (eql(cmd, "install")) return integrations.installCmd(&ctx, rest, true);
+    if (eql(cmd, "uninstall")) return integrations.installCmd(&ctx, rest, false);
+    if (eql(cmd, "integrations")) return integrations.integrationsCmd(&ctx, rest);
     return speak(&ctx, args.items);
 }
 

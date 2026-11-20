@@ -691,50 +691,57 @@ dragging files onto the app in Finder).
 - *Done when:* finishing a turn in each agent speaks the reply with that
   source's voice.
 
-**Phase 4 progress (in progress, 2026-11-19)**
+**Phase 4 results (2026-11-19)**
 
-Done:
-- Confirmed every hook format against its source:
-  - Claude Code's Stop hook gives `last_assistant_message` and supports
-    `"async": true`.
-  - Codex's notify payload has `type: "agent-turn-complete"`,
-    `last-assistant-message`, `cwd` and `thread-id`.
-  - OpenCode loads global plugins from `~/.config/opencode/plugins/`, and the
-    `session.idle` event carries `sessionID`.
-  - herdr mods are JS with `agents()` and `fetch`.
-- Per-source settings: `settings.sources.<app>` with `enabled`, `voice` and
-  `announce`, applied in `core.speak`. They can be patched via
-  `PATCH /v1/settings {"sources": {...}}`.
-- `integrations/`:
-  - the Claude Code marketplace and plugin (Stop hook and MCP server); both
-    validate with `claude plugin validate`
-  - the OpenCode plugin (`talk-to-me.ts`)
-  - the herdr mod (a status bar with pause and stop that announces agents
-    without native hooks); it passes `herdr-app check`
+Built:
+- **Hook adapters** in `src/integrations.zig`, `talktome hook claude|codex|opencode`.
+  Each queues the reply with policy `replace`, the project folder as label and
+  the agent session as session. Hooks always exit 0.
+  - **Claude:** a Stop hook (async) using `last_assistant_message`, falling
+    back to the transcript (text blocks after the last real prompt).
+  - **Codex:** `notify` with the JSON as the last argument. `--chain` runs the
+    previous notify program with the same payload.
+  - **OpenCode:** a plugin on `session.idle` that skips sub-agent sessions and
+    pipes the last assistant text in.
+- **`talktome mcp [--app NAME]`:** a stdio MCP server with the tools `speak`
+  (with `interrupt` and `voice`), `stop` and `list_voices`. It replaces the
+  planned HTTP `/mcp`, so the token stays out of agent configs. The Claude Code
+  plugin declares it.
+- **`talktome install|uninstall claude|codex|opencode|herdr`** and
+  **`talktome integrations [--json]`**:
+  - **Claude:** copies the marketplace into the support dir with an absolute
+    `talktome` path, then runs `claude plugin marketplace add` and `install`.
+  - **Codex:** rewrites the top-level `notify`, keeping the old entry through
+    `--chain`, after a one-time `config.toml.talktome-backup`.
+  - **OpenCode:** writes `~/.config/opencode/plugins/talk-to-me.ts`.
+  - **herdr:** copies the mod and runs `herdr-app check`.
+- **Per-source settings** (`settings.sources.<app>`): enabled (mute), voice,
+  and "say its name first".
+- **Sources page in Settings:** install status with Install/Remove (runs the
+  bundled CLI) and per-agent toggles and voice.
+- **herdr mod:** a status bar with pause and stop that announces agents without
+  native hooks.
 
-Left to do:
-- `src/integrations.zig`:
-  - `talktome hook claude|codex|opencode`. Policy `replace`, label is the cwd
-    basename, session from the payload. Claude falls back to `transcript_path`.
-    Codex `--chain` runs the previous notify program. Hooks always exit 0.
-  - `talktome mcp [--app NAME]`: a stdio JSON-RPC server with the tools
-    `speak`, `stop` and `list_voices`. It replaces the planned HTTP `/mcp` so
-    the token stays out of agent config files.
-  - `talktome install|uninstall claude|codex|opencode|herdr` and
-    `talktome integrations [--json]`:
-    - Copy `integrations/` to the support dir, with absolute `talktome` paths.
-    - Claude: `claude plugin marketplace add`, then `install`.
-    - Codex: rewrite the top-level `notify` with a backup, keeping the
-      existing entry through `--chain`.
-    - OpenCode: write the plugin file.
-    - herdr: copy the mod and run `herdr-app check`.
-  - Main's helpers are already `pub` for this.
-- Install `integrations/` into `zig-out/share/talk-to-me/` and the app's
-  Resources.
-- A Sources page in Settings: per-agent enable, voice and announce, plus
-  install status and buttons (call the bundled `talktome install`).
-- Test against a temporary HOME before touching real configs, and ask before
-  installing into the real `~/.codex`, `~/.claude`, OpenCode and herdr.
+Verified, against a fake HOME and a test server:
+- **Claude hook:** a markdown reply became 3 chunks, with "Code block."
+  announced.
+- **Transcript fallback:** picked up both text blocks of the last turn across a
+  tool call.
+- **Codex:** speaks, and the chained program received the JSON.
+- **OpenCode:** speaks.
+- **MCP:** `initialize`, `tools/list`, `speak`, `list_voices` and unknown
+  methods behave. An empty-object bug (`.{}` serialized as `[]`) was fixed.
+- **Installers:** all four install, detect and uninstall. Codex keeps the
+  Computer Use notify through `--chain`, a second install is a no-op, and
+  uninstall restored `config.toml` byte for byte. The Claude plugin shows as
+  enabled in `claude plugin list`.
+- **Per-source settings:** Codex announce plus voice worked, and muted OpenCode
+  was dropped.
+
+Not done:
+- Nothing has been installed into the real agent configs. That's your choice,
+  from Settings → Sources or `talktome install …`.
+- A live end-to-end run inside each real agent.
 
 **Phase 5: browser**
 - Fork the extension, add pairing, SSE highlighting, and ChatGPT and Claude

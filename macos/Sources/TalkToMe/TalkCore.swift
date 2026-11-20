@@ -69,7 +69,52 @@ struct Settings: Codable, Equatable {
     var code_blocks: String = "announce"
     var tables: String = "announce"
     var dedupe_seconds: Int = 30
+    var sources: [String: SourceSetting] = [:]
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        model = try c.decodeIfPresent(String.self, forKey: .model) ?? "kokoro"
+        voice = try c.decodeIfPresent(String.self, forKey: .voice) ?? ""
+        speed = try c.decodeIfPresent(Double.self, forKey: .speed) ?? 1.0
+        port = try c.decodeIfPresent(Int.self, forKey: .port) ?? 9932
+        idle_unload_minutes = try c.decodeIfPresent(Int.self, forKey: .idle_unload_minutes) ?? 15
+        code_blocks = try c.decodeIfPresent(String.self, forKey: .code_blocks) ?? "announce"
+        tables = try c.decodeIfPresent(String.self, forKey: .tables) ?? "announce"
+        dedupe_seconds = try c.decodeIfPresent(Int.self, forKey: .dedupe_seconds) ?? 30
+        sources = try c.decodeIfPresent([String: SourceSetting].self, forKey: .sources) ?? [:]
+    }
 }
+
+struct SourceSetting: Codable, Equatable {
+    var enabled: Bool = true
+    var voice: String = ""
+    var announce: Bool = false
+}
+
+/// Agents Talk to Me integrates with: settings key (source app) and the
+/// `talktome install` target.
+struct Integration: Identifiable {
+    let app: String
+    let target: String
+    let name: String
+    let detail: String
+    var id: String { app }
+
+    static let all = [
+        Integration(app: "claude-code", target: "claude", name: "Claude Code",
+                    detail: "A plugin speaks each reply when a turn ends and adds a speak tool."),
+        Integration(app: "codex", target: "codex", name: "Codex",
+                    detail: "Uses Codex's notify setting; an existing notify program keeps running."),
+        Integration(app: "opencode", target: "opencode", name: "OpenCode",
+                    detail: "A plugin speaks the reply when a session goes idle."),
+        Integration(app: "herdr", target: "herdr", name: "herdr",
+                    detail: "A status bar with pause and stop; says when other agents finish."),
+    ]
+}
+
+struct IntegrationStatus: Decodable { var installed: Bool; var present: Bool }
 
 private struct ModelList: Decodable { var models: [ModelInfo] }
 private struct VoiceList: Decodable { var model: String; var voices: [VoiceInfo] }
@@ -239,6 +284,51 @@ final class TalkCore: ObservableObject {
             await refreshSettings()
             if patch["voice"] != nil || patch["model"] != nil { await refreshVoices() }
         }
+    }
+
+    // MARK: integrations (run the bundled talktome CLI)
+
+    @Published var integrations: [String: IntegrationStatus] = [:]
+    @Published var integrationMessage: String?
+
+    private nonisolated func runCLI(_ args: [String]) async -> (Int32, String) {
+        await Task.detached {
+            guard let url = Bundle.main.url(forResource: "talktome", withExtension: nil) else { return (127, "talktome is not in the app bundle") }
+            let p = Process()
+            p.executableURL = url
+            p.arguments = args
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = pipe
+            do { try p.run() } catch { return (127, error.localizedDescription) }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            return (p.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+        }.value
+    }
+
+    func refreshIntegrations() async {
+        let (_, out) = await runCLI(["integrations", "--json"])
+        if let data = out.data(using: .utf8),
+           let s = try? JSONDecoder().decode([String: IntegrationStatus].self, from: data) {
+            integrations = s
+        }
+    }
+
+    func setIntegration(_ i: Integration, installed: Bool) {
+        Task {
+            let (code, out) = await runCLI([installed ? "install" : "uninstall", i.target])
+            integrationMessage = code == 0
+                ? out.trimmingCharacters(in: .whitespacesAndNewlines)
+                : "\(i.name): \(out.trimmingCharacters(in: .whitespacesAndNewlines))"
+            await refreshIntegrations()
+        }
+    }
+
+    func source(_ app: String) -> SourceSetting { settings.sources[app] ?? SourceSetting() }
+
+    func updateSource(_ app: String, _ patch: [String: Any]) {
+        update(["sources": [app: patch]])
     }
 
     func previewVoice(_ v: VoiceInfo) {

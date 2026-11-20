@@ -21,6 +21,8 @@ cp "$OUT/bin/default.metallib" "$OUT/bin/ggml-tensor.metallib" "$APP/Contents/Re
 for b in "$BIN"/*.bundle; do [ -e "$b" ] && cp -R "$b" "$APP/Contents/Resources/"; done
 # the CLI ships inside the app; Settings → General links it into ~/.local/bin
 cp "$OUT/bin/talktome" "$APP/Contents/Resources/talktome"
+# agent integrations, found by `talktome install` next to the CLI
+cp -R "$ROOT/integrations" "$APP/Contents/Resources/integrations"
 
 # ad-hoc signature (Developer ID signing and notarization come in Phase 6)
 codesign --force --deep --sign - "$APP" >/dev/null

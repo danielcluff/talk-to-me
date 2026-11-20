@@ -745,8 +745,14 @@ command the Sources page's Install button runs), after linking
   live hook through the installed plugin spoke.
 - Codex: `notify` chains the Computer Use client. A backup is at
   `~/.codex/config.toml.talktome-backup`.
-- OpenCode plugin and herdr mod are installed. herdr wasn't running, so the
-  mod hasn't been seen live yet.
+- OpenCode plugin and herdr mod are installed.
+- herdr didn't show the mod at first: its shipped `main` layout is read-only,
+  so a new mod can't dock into it. `talktome install herdr` now also writes
+  `layouts/talk-to-me.json`, a copy of `main` whose bottom row holds the
+  status bar plus the Talk to Me bar, and switches to it with
+  `layout.switch`. Uninstall switches back to `main` and deletes the copy.
+  The bar was seen live with "Speaking: …" and pause and stop. A herdr update
+  to `main` won't reach the copy; reinstalling regenerates it.
 
 Still to check: a real turn in each agent (new sessions load the plugins).
 

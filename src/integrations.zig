@@ -555,16 +555,79 @@ fn opencode(ctx: *Ctx, install: bool) !void {
     try main.outf(ctx, "OpenCode: plugin installed ({s}). Restart OpenCode to load it.\n", .{dst});
 }
 
+/// herdr: the mod, plus a personal copy of the shipped `main` layout with the
+/// Talk to Me bar beside the status bar. Shipped layouts are read-only, so
+/// herdr can't dock a new mod into `main` by itself.
 fn herdr(ctx: *Ctx, install: bool) !void {
-    const dst = try std.fs.path.join(ctx.arena, &.{ try home(ctx), ".config", "herdr-app", "mods", "talk-to-me" });
+    const herdr_home = try std.fs.path.join(ctx.arena, &.{ try home(ctx), ".config", "herdr-app" });
+    const dst = try std.fs.path.join(ctx.arena, &.{ herdr_home, "mods", "talk-to-me" });
+    const layout = try std.fs.path.join(ctx.arena, &.{ herdr_home, "layouts", "talk-to-me.json" });
     if (!install) {
+        // back to herdr's own layout first, so the window never shows a missing mod
+        _ = try runQuiet(ctx, &.{ "herdr-app", "do", "layout.switch", "{\"name\":\"main\"}" });
+        Io.Dir.cwd().deleteFile(ctx.io, layout) catch {};
         Io.Dir.cwd().deleteTree(ctx.io, dst) catch {};
-        return main.out(ctx.io, "herdr: mod removed\n");
+        return main.out(ctx.io, "herdr: mod and layout removed\n");
     }
     const src = try std.fs.path.join(ctx.arena, &.{ try sourceDir(ctx), "herdr", "talk-to-me" });
     for ([_][]const u8{ "main.js", "mod.json" }) |f| {
         try writeFile(ctx, try std.fs.path.join(ctx.arena, &.{ dst, f }), try readFile(ctx, try std.fs.path.join(ctx.arena, &.{ src, f })));
     }
     if (!try run(ctx, &.{ "herdr-app", "check", dst })) try main.out(ctx.io, "herdr: installed, but `herdr-app check` reported a problem\n");
-    try main.outf(ctx, "herdr: mod installed ({s})\n", .{dst});
+
+    const base = readFile(ctx, try std.fs.path.join(ctx.arena, &.{ herdr_home, "layouts", "main.json" })) catch {
+        return main.outf(ctx, "herdr: mod installed ({s}); open herdr once, then install again to add the bar\n", .{dst});
+    };
+    var tree = try std.json.parseFromSliceLeaky(std.json.Value, ctx.arena, base, .{});
+    if (!try addBar(ctx.arena, &tree)) {
+        return main.outf(ctx, "herdr: mod installed ({s}), but herdr's layout has no status bar to sit beside\n", .{dst});
+    }
+    try writeFile(ctx, layout, try std.json.Stringify.valueAlloc(ctx.arena, tree, .{ .whitespace = .indent_2 }));
+    const switched = try runQuiet(ctx, &.{ "herdr-app", "do", "layout.switch", "{\"name\":\"talk-to-me\"}" });
+    try main.outf(ctx, "herdr: mod installed; layout \"talk-to-me\" adds the bar at the bottom{s}\n", .{
+        if (switched) " (now shown)" else " (pick it with ctrl-shift-l)",
+    });
+}
+
+/// Replace the node with id "status" by a row: the status bar, then the
+/// Talk to Me bar on the right.
+fn addBar(a: std.mem.Allocator, v: *std.json.Value) !bool {
+    if (v.* != .object) return false;
+    const obj = &v.object;
+    if (obj.get("id")) |id| if (id == .string and std.mem.eql(u8, id.string, "status")) {
+        const size = obj.get("size");
+        var status_bar = v.*;
+        _ = status_bar.object.orderedRemove("size");
+        var bar: std.json.ObjectMap = .empty;
+        try bar.put(a, "id", .{ .string = "talk-to-me" });
+        try bar.put(a, "type", .{ .string = "block" });
+        var bar_size: std.json.ObjectMap = .empty;
+        try bar_size.put(a, "px", .{ .integer = 380 });
+        try bar.put(a, "size", .{ .object = bar_size });
+        var content: std.json.ObjectMap = .empty;
+        try content.put(a, "mod", .{ .string = "talk-to-me" });
+        try bar.put(a, "content", .{ .object = content });
+
+        var children = std.json.Array.init(a);
+        try children.append(status_bar);
+        try children.append(.{ .object = bar });
+        var row: std.json.ObjectMap = .empty;
+        try row.put(a, "id", .{ .string = "status-row" });
+        try row.put(a, "type", .{ .string = "row" });
+        if (size) |sz| try row.put(a, "size", sz);
+        try row.put(a, "children", .{ .array = children });
+        v.* = .{ .object = row };
+        return true;
+    };
+    if (obj.getPtr("children")) |ch| if (ch.* == .array) {
+        for (ch.array.items) |*child| if (try addBar(a, child)) return true;
+    };
+    return false;
+}
+
+/// Run without showing output; false if it fails or can't start (e.g. herdr isn't running).
+fn runQuiet(ctx: *Ctx, argv: []const []const u8) !bool {
+    var child = std.process.spawn(ctx.io, .{ .argv = argv, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch return false;
+    const term = child.wait(ctx.io) catch return false;
+    return term.success();
 }

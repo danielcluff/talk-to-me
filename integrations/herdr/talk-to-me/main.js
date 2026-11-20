@@ -12,6 +12,12 @@ import { agents, home, readTextFile, theme } from "herdr";
 
 const HOOKED = new Set(["claude-code", "codex", "opencode"]);
 const SUPPORT = "/Library/Application Support/TalkToMe";
+// same names as the menu bar app
+const NAMES = {
+  "claude-code": "Claude", codex: "Codex", opencode: "OpenCode", cli: "Terminal",
+  file: "File", selection: "Selection", clipboard: "Clipboard", menu: "Clipboard",
+  service: "Services", preview: "Preview", herdr: "herdr", mcp: "Agent",
+};
 
 export default class TalkToMe extends View {
   init(_props, cx) {
@@ -91,7 +97,7 @@ export default class TalkToMe extends View {
     const label = !p
       ? `Talk to Me: ${this.error ?? "connecting…"}`
       : speaking
-        ? `${p.state === "paused" ? "Paused" : "Speaking"}: ${[p.app, p.label].filter(Boolean).join(" · ")} (${Math.min(p.index + 1, p.count)}/${p.count})${p.queued ? `, ${p.queued} queued` : ""}`
+        ? `${p.state === "paused" ? "Paused" : "Speaking"}: ${[NAMES[p.app] ?? p.app, p.label].filter(Boolean).join(" · ")} (${Math.min(p.index + 1, p.count)}/${p.count})${p.queued ? `, ${p.queued} queued` : ""}`
         : "Talk to Me: idle";
     const button = (id, text, onClick) =>
       div()

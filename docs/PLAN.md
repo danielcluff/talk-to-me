@@ -765,6 +765,96 @@ Still to check: a real turn in each agent (new sessions load the plugins).
 - tiny-voca, Soprano, Chatterbox Turbo and ZONOS3; History; pronunciation
   dictionary; Developer ID signing and notarization; launch at login.
 
+**Phase 7: the briefing agent (summaries, then the full report on request)**
+
+Agents finish with several paragraphs. Instead of reading every report in
+full, one agent, picked in Settings, receives all agent reports, speaks a
+short summary, then asks whether you want the whole thing.
+
+*The experience*
+1. Codex finishes in `redshift`. Its report reaches Talk to Me through the
+   Phase 4 hook, as now.
+2. The briefing agent reads it and writes a summary of one to three spoken
+   sentences: what was done, what failed, and anything waiting on you.
+3. Talk to Me says: "Codex, in redshift: refactored the parser, all tests
+   pass, and it wants to know whether to bump the version. Want the full
+   report?"
+4. It listens for about 4 seconds after the question:
+   - "yes", "sure" or "read it": the full report is read, as today.
+   - "no" or "skip": done.
+   - Silence: done, and the report stays available. A "Read last full
+     report" hotkey and menu item, plus History, still get it later.
+   - Pressing the Read Selection hotkey during the window also counts as
+     yes, for when talking isn't convenient.
+
+*How it fits the existing design*
+- **A new policy, `brief`.** It's the default for agent sources once the
+  briefing agent is on, and can be set per source in Settings → Sources, so
+  you can, say, brief Codex but always read Claude in full. A brief job holds
+  the full text and is spoken in two parts: the summary plus the question,
+  then (on yes) the full report, through the same queue, voices and
+  pause/stop.
+- **Summarizing runs on its own worker,** so a slow summary never blocks TTS.
+  Jobs show a "summarizing…" state in the menu and the herdr bar.
+- **Several reports arriving together** queue as separate briefings (the
+  existing queue policy). Later option: if reports pile up past N, merge them
+  into one ("Three agents finished: …").
+
+*Picking the agent (summarizer backends)* behind one interface,
+`summarize(report, source) -> text`:
+- **Local model, in-process (recommended default).** A small instruct GGUF
+  (for example Qwen3 1.7B or 4B) loaded by the same llama.cpp engine. Fully
+  local, no account, about 1 to 2 s per summary on the M4 (to measure).
+  Downloaded from the Models page like TTS models.
+- **Ollama.** Uses a model you already run (your `opencode.json` points at
+  Ollama on localhost).
+- **Claude Code** (`claude -p` with a summary prompt) or **Codex**
+  (`codex exec`): the strongest summaries, but the report goes to that
+  provider's cloud. Off unless you pick it, and Settings says so plainly.
+- **Common pieces:** the prompt is shared (spoken style, no markdown, lead
+  with outcome, then blockers and questions for you, at most about 60
+  words). If the summarizer fails or times out (8 s), fall back to reading
+  the first paragraph plus "full report available".
+
+*Listening for yes or no*
+- **Local speech recognition** with Qwen3-ASR 0.6B through libmtmd, which
+  llama.cpp already supports (`common_chat_get_asr_prompt`, with a hotwords
+  hint: "yes, no, read it, skip, sure"). It's downloaded from Models as an
+  optional "Listening" model.
+- **The microphone opens only for the answer window,** after playback of the
+  question ends, so the app never hears its own voice. It needs Microphone
+  permission (on the Permissions page). The menu bar icon shows a listening
+  state.
+- **Simple matching:** recognized text is matched against yes and no word
+  lists, and anything else counts as no answer. Optional later: a "Listen for
+  an answer" toggle per source, and a longer window.
+- **Fallback if ASR quality or latency disappoints:** Apple's on-device
+  `SFSpeechRecognizer` (works on Sequoia, no download), behind the same
+  interface.
+- **Mic sharing with VoiceInk:** both use the mic only while active, so they
+  shouldn't conflict. To verify.
+
+*Settings*
+- A **Briefing** page: on/off, the summarizer backend and model, the
+  summary-length hint, the listen window (2 to 8 s), "listen for an answer"
+  on/off, and the yes/no words.
+- **Sources** gets a per-agent "Brief me / Read in full" choice.
+- **Models** lists the summarizer and ASR models next to the voices.
+
+*Done when*
+- A multi-paragraph Codex or Claude report is spoken as a short summary plus
+  "Want the full report?".
+- Saying "yes" reads the full report; "no" or silence ends it.
+- The full report stays reachable from the menu, the hotkey and History.
+- The summary arrives within about 3 s of the agent finishing with the local
+  model.
+
+*Open questions*
+- The default summarizer: local model (private, slower setup) or your existing
+  Claude/Codex (better summaries, leaves the machine)?
+- Should a briefing also offer actions beyond reading, such as "open that
+  tab in herdr"?
+
 ---
 
 ## 11. Repo layout

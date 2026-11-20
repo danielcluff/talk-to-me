@@ -1,5 +1,5 @@
-// Talk to Me content script: in-page controls, text extraction entry points,
-// highlight, and auto-read of new ChatGPT / Claude replies.
+// Talk to Me content script: the floating button and playback bar, text
+// extraction (selection, tab, picked element) and the sentence highlight.
 (() => {
   if (window.__kokoroReaderLoaded) return;
   window.__kokoroReaderLoaded = true;
@@ -12,7 +12,6 @@
   let state = { status: "idle", index: -1, total: 0, label: "", error: "" };
   let settings = { showPill: true, maxChunk: 150 };
   let ui = null;
-  let menuOpen = false;
   let hlStyled = false;
   let toastTimer = 0;
 
@@ -38,11 +37,6 @@
     ".bar button:hover{background:rgba(255,255,255,.1);color:#ffbe0b}",
     ".meta{font-variant-numeric:tabular-nums;color:#a8a29e;min-width:52px;text-align:center}",
     ".label{max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#d6d3d1}",
-    ".menu{position:absolute;right:0;bottom:52px;min-width:190px;padding:6px;border-radius:12px;border:1px solid rgba(255,255,255,.14);background:rgba(23,23,23,.96);box-shadow:0 10px 30px rgba(0,0,0,.45);backdrop-filter:blur(10px)}",
-    ".menu button{all:unset;display:flex;justify-content:space-between;gap:16px;box-sizing:border-box;width:100%;padding:7px 10px;border-radius:8px;cursor:pointer;color:#e7e5e4}",
-    ".menu button:hover{background:rgba(255,255,255,.09);color:#ffbe0b}",
-    ".menu kbd{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;color:#78716c}",
-    ".menu hr{border:0;border-top:1px solid rgba(255,255,255,.1);margin:5px 4px}",
     ".toast{position:absolute;right:0;bottom:52px;max-width:260px;padding:8px 10px;border-radius:10px;background:rgba(23,23,23,.96);border:1px solid rgba(255,255,255,.14);color:#e7e5e4;box-shadow:0 8px 24px rgba(0,0,0,.4)}",
     "[hidden]{display:none!important}"
   ].join("\n");
@@ -80,15 +74,8 @@
       '    <span class="label"></span>',
       '    <button data-act="stop" title="Stop">' + ICON.stop + "</button>",
       "  </div>",
-      '  <div class="menu" hidden>',
-      '    <button data-scope="page">Read this tab <kbd>Alt+Shift+A</kbd></button>',
-      '    <button data-scope="reply">Read last reply <kbd>Alt+Shift+L</kbd></button>',
-      '    <button data-scope="selection">Read selection <kbd>⌥⇧R</kbd></button>',
-      '    <hr>',
-      '    <button data-act="pick">Pick an element...</button>',
-      "  </div>",
       '  <div class="toast" hidden></div>',
-      '  <button class="fab" title="Talk to Me">' + ICON.speaker + "</button>",
+      '  <button class="fab" title="Read the selection, or this tab (Talk to Me)">' + ICON.speaker + "</button>",
       "</div>"
     ].join("");
 
@@ -99,34 +86,24 @@
       root: shadow.querySelector(".root"),
       fab: shadow.querySelector(".fab"),
       bar: shadow.querySelector(".bar"),
-      menu: shadow.querySelector(".menu"),
       toast: shadow.querySelector(".toast"),
       meta: shadow.querySelector(".meta"),
       label: shadow.querySelector(".label"),
       pause: shadow.querySelector('[data-act="pause"]')
     };
 
+    // keep the page selection when the button is pressed
+    ui.fab.addEventListener("mousedown", (ev) => ev.preventDefault());
     ui.fab.addEventListener("click", () => {
-      menuOpen = !menuOpen;
-      render();
+      const sel = window.getSelection();
+      readScope(sel && sel.toString().trim() ? "selection" : "page");
     });
 
     shadow.addEventListener("click", (ev) => {
-      const scope = ev.target.closest("[data-scope]");
-      if (scope) {
-        menuOpen = false;
-        render();
-        readScope(scope.dataset.scope);
-        return;
-      }
       const act = ev.target.closest("[data-act]");
       if (!act) return;
       const name = act.dataset.act;
-      if (name === "pick") {
-        menuOpen = false;
-        render();
-        pickElement();
-      } else if (name === "pause") {
+      if (name === "pause") {
         send({ t: "control", action: state.status === "paused" ? "resume" : "pause" });
       } else if (name === "prev" || name === "next") {
         send({ t: "control", action: name });
@@ -148,7 +125,6 @@
     const active = state.status === "playing" || state.status === "loading" || state.status === "paused";
     ui.bar.hidden = !active;
     ui.fab.hidden = active;
-    ui.menu.hidden = !(menuOpen && !active);
     if (active) {
       ui.meta.textContent = state.status === "loading" ? "..." : (state.index + 1) + " / " + state.total;
       ui.label.textContent = state.label || "";
@@ -196,22 +172,17 @@
     }
     let result = null;
     if (scope === "selection") result = T.selectionChunks(settings.maxChunk);
-    else if (scope === "reply") result = T.replyChunks(settings.maxChunk);
     else result = T.pageChunks(settings.maxChunk);
 
-    if (scope === "reply" && !result) {
-      toast("No reply found here. Use Pick an element.");
-      return;
-    }
     if (!result) {
       toast(scope === "selection" ? "Nothing is selected" : "Nothing to read here");
       return;
     }
-    start(result.chunks, scope === "reply" ? siteName() || result.label : result.label, scope === "reply" ? { policy: "interrupt", kind: "reply" } : null);
+    start(result.chunks, scope === "selection" ? "Selection" : result.label, null);
   }
 
-  // policy: "interrupt" for what you ask for, "queue" for automatic reads.
-  // kind: "reply" marks a model reply (briefings in Phase 7 apply to those only).
+  // Everything the extension reads is something you asked for: it interrupts
+  // and is never summarized (Phase 7 briefs agent replies only).
   function start(list, label, opts) {
     if (!list || !list.length) {
       if (!opts) toast("Nothing to read here");
@@ -359,78 +330,6 @@
     }
     if (changes.maxChunk) settings.maxChunk = changes.maxChunk.newValue || 150;
   });
-
-  // ---------- auto-read new replies (ChatGPT, Claude) ----------
-
-  const SITES = [
-    {
-      name: "ChatGPT",
-      key: "autoReadChatGPT",
-      host: /(^|\.)(chatgpt\.com|chat\.openai\.com)$/,
-      streaming: () => !!document.querySelector('[data-testid="stop-button"], button[aria-label="Stop streaming"]')
-    },
-    {
-      name: "Claude",
-      key: "autoReadClaude",
-      host: /(^|\.)claude\.ai$/,
-      streaming: () => !!document.querySelector('[data-is-streaming="true"], button[aria-label="Stop response"]')
-    }
-  ];
-  const site = SITES.find((s) => s.host.test(location.hostname)) || null;
-
-  function siteName() {
-    return site ? site.name : "";
-  }
-
-  const auto = { on: false, observer: null, timer: 0, sawStreaming: false, last: "" };
-
-  function replyFingerprint() {
-    const r = T.replyChunks(settings.maxChunk);
-    return r ? { result: r, text: r.chunks.map((c) => c.text).join(" ") } : null;
-  }
-
-  // Read a reply only after it was seen streaming and then settled, so
-  // opening a conversation never reads its history.
-  function checkReply() {
-    if (!auto.on || !site) return;
-    if (site.streaming()) {
-      auto.sawStreaming = true;
-      return;
-    }
-    if (!auto.sawStreaming) return;
-    const fp = replyFingerprint();
-    if (!fp || fp.text === auto.last) return;
-    auto.sawStreaming = false;
-    auto.last = fp.text;
-    start(fp.result.chunks, site.name, { policy: "queue", kind: "reply" });
-  }
-
-  function setAutoRead(on) {
-    if (!site || on === auto.on) return;
-    auto.on = on;
-    if (on) {
-      const fp = replyFingerprint();
-      auto.last = fp ? fp.text : "";
-      auto.sawStreaming = site.streaming();
-      auto.observer = new MutationObserver(() => {
-        if (site.streaming()) auto.sawStreaming = true;
-        clearTimeout(auto.timer);
-        auto.timer = setTimeout(checkReply, 1500);
-      });
-      auto.observer.observe(document.body || document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ["data-is-streaming", "data-testid", "aria-label"] });
-    } else if (auto.observer) {
-      auto.observer.disconnect();
-      auto.observer = null;
-      clearTimeout(auto.timer);
-    }
-  }
-
-  if (site) {
-    chrome.storage.sync.get({ [site.key]: false }).then((got) => setAutoRead(!!got[site.key])).catch(() => {});
-    chrome.storage.onChanged.addListener((changes) => {
-      if (changes[site.key]) setAutoRead(!!changes[site.key].newValue);
-    });
-  }
 
   getSettings().then(buildUI);
 })();

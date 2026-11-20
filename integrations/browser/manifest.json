@@ -2,32 +2,50 @@
   "manifest_version": 3,
   "name": "Talk to Me",
   "version": "0.5.0",
-  "description": "Read pages, selections and ChatGPT or Claude replies aloud with the Talk to Me app (local text-to-speech).",
-  "permissions": ["storage", "offscreen", "contextMenus", "scripting", "activeTab"],
-  "host_permissions": ["http://127.0.0.1/*", "http://localhost/*"],
-  "background": { "service_worker": "background.js" },
+  "description": "Read a page, a picked element or a selection aloud with the Talk to Me app (local text-to-speech), with the sentence highlighted as it's spoken.",
+  "permissions": [
+    "storage",
+    "offscreen",
+    "contextMenus",
+    "scripting",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "action": {
     "default_title": "Talk to Me",
     "default_popup": "popup.html",
-    "default_icon": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
-  "icons": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
   "content_scripts": [
     {
-      "matches": ["http://*/*", "https://*/*", "file:///*"],
-      "js": ["lib/text.js", "content.js"],
+      "matches": [
+        "http://*/*",
+        "https://*/*",
+        "file:///*"
+      ],
+      "js": [
+        "lib/text.js",
+        "content.js"
+      ],
       "run_at": "document_idle"
     }
   ],
-  "commands": {
-    "read-reply": {
-      "suggested_key": { "default": "Alt+Shift+L", "mac": "Alt+Shift+L" },
-      "description": "Read the last agent reply"
-    },
-    "read-page": {
-      "suggested_key": { "default": "Alt+Shift+A", "mac": "Alt+Shift+A" },
-      "description": "Read this tab or document"
-    }
-  },
-  "content_security_policy": { "extension_pages": "script-src 'self'; object-src 'self'" }
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
 }

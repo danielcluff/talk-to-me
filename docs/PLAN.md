@@ -814,6 +814,31 @@ Verified:
 Not verified: auto-read on the live ChatGPT and Claude sites (needs your
 accounts), and the app's pairing dialog (the CLI approved in the test).
 
+**Phase 5 follow-up: a smaller extension (2026-11-19).** The app now covers
+most of what the extension used to, so the extension keeps only what needs a
+page:
+- **Popup:** "Read this tab", "Pick an element", a ⌥⇧R hint for selections,
+  the floating-button toggle, and Connect.
+- **Floating button:** a click reads the selection, or the tab when nothing
+  is selected. There's no menu, and its mousedown is suppressed so clicking
+  it keeps the selection. The on-page bar (previous, pause, next, stop)
+  stays.
+- **Right-click:** one item per context ("Read with Talk to Me" on a
+  selection, "Read this tab with Talk to Me" on the page), so Chrome shows
+  it without a submenu.
+- **Removed:** read last reply, auto-read of ChatGPT and Claude replies,
+  pasting text or reading files in the popup, and the extension's keyboard
+  shortcuts. The global ⌥⇧R and ⌥⇧X cover the browser.
+- Verified with a CDP run in a test Brave profile, 12 of 12 checks, adding
+  "floating button reads the selection" and "no menu".
+
+**Signing for development.** macOS keys Accessibility to the code signature,
+and an ad-hoc signature changes every build, so permission "turned on" in
+System Settings stops matching the running app. `build-app.sh` now signs with
+`$TALKTOME_SIGN_IDENTITY`, a "Talk to Me Dev" self-signed code-signing
+certificate, or an "Apple Development" certificate, in that order, and only
+falls back to ad hoc (with a warning).
+
 **Phase 6: more models and polish**
 - tiny-voca, Soprano, Chatterbox Turbo and ZONOS3; History; pronunciation
   dictionary; Developer ID signing and notarization; launch at login.
@@ -843,12 +868,10 @@ short summary, then asks whether you want the whole thing.
 *Only model replies are briefed.* Summaries apply to agent replies, never to
 things you asked to hear:
 - **Briefed:** agent replies from Claude Code, Codex and OpenCode (their
-  hooks), the browser extension's auto-read of ChatGPT and Claude replies
-  (Phase 5), and MCP `speak` calls longer than the summary would be.
+  hooks), and MCP `speak` calls longer than the summary would be.
 - **Always read in full:** files (CLI, Open With, Services, Finder via the
-  hotkey), selections, the clipboard, piped text, the browser's "read page"
-  and "read selection", herdr's short "X finished" notices, and voice
-  previews.
+  hotkey), selections, the clipboard, piped text, everything from the browser
+  extension, herdr's short "X finished" notices, and voice previews.
 - The rule is enforced in the core by source type, not only by settings, so
   a new input can't be briefed by accident. Reading a file with the `brief`
   policy is rejected.

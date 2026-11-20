@@ -8,9 +8,7 @@ importScripts("lib/text.js");
 
 const DEFAULTS = {
   api: "http://127.0.0.1:9932",
-  showPill: true,
-  autoReadChatGPT: false,
-  autoReadClaude: false
+  showPill: true
 };
 
 const IDLE = { status: "idle", index: -1, total: 0, label: "", tabId: null, jobId: null, error: "" };
@@ -309,12 +307,6 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
       });
       respond({ ok: true });
       return false;
-    case "speak": {
-      // nothing on a page to highlight: let the app chunk it
-      startReading({ text: msg.text || "", label: msg.label || "Text", tabId: null });
-      respond({ ok: true });
-      return false;
-    }
     case "control":
       control(msg.action);
       respond({ ok: true });
@@ -342,27 +334,18 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
 
 // ---------- commands, menus, lifecycle ----------
 
-// Read selection and Stop are Talk to Me's global hotkeys (⌥⇧R, ⌥⇧X), which
-// also work here; the extension keeps only the page-aware commands.
-chrome.commands.onCommand.addListener((command) => {
-  readInActiveTab(command === "read-reply" ? "reply" : "page");
-});
-
+// Read Selection and Stop are Talk to Me's global hotkeys (⌥⇧R, ⌥⇧X), which
+// work in the browser too. The right-click menu has one item per context, so
+// Chrome shows it directly instead of a submenu.
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.removeAll(() => {
-    chrome.contextMenus.create({ id: "read-selection", title: "Read selection", contexts: ["selection"] });
-    chrome.contextMenus.create({ id: "read-page", title: "Read this tab", contexts: ["page"] });
-    chrome.contextMenus.create({ id: "read-reply", title: "Read last reply", contexts: ["page"] });
-    chrome.contextMenus.create({ id: "stop", title: "Stop reading", contexts: ["page", "selection"] });
+    chrome.contextMenus.create({ id: "read-selection", title: "Read with Talk to Me", contexts: ["selection"] });
+    chrome.contextMenus.create({ id: "read-page", title: "Read this tab with Talk to Me", contexts: ["page"] });
   });
 });
 
 chrome.contextMenus.onClicked.addListener((info, tab) => {
-  if (info.menuItemId === "stop") {
-    control("stop");
-    return;
-  }
-  const scope = info.menuItemId === "read-selection" ? "selection" : info.menuItemId === "read-reply" ? "reply" : "page";
+  const scope = info.menuItemId === "read-selection" ? "selection" : "page";
   if (tab && tab.id != null) sendOrInject(tab.id, { t: "read", scope: scope }).catch(() => {});
 });
 

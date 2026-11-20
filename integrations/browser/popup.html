@@ -15,47 +15,25 @@
   </header>
 
   <section id="connect" class="card" hidden>
-    <div id="connect-text">This extension isn't connected to the Talk to Me app yet.</div>
+    <div>This extension isn't connected to the Talk to Me app yet.</div>
     <div class="row-actions">
       <button id="connect-btn" class="primary">Connect</button>
       <span id="code" class="status"></span>
     </div>
   </section>
 
-  <section id="now" class="card now" hidden>
-    <div class="now-text">
-      <div id="now-label" class="label">Reading</div>
-      <div id="now-meta" class="meta"></div>
-    </div>
-    <div class="transport">
-      <button id="toggle" class="ghost" title="Pause">Pause</button>
-      <button id="stop" class="ghost" title="Stop">Stop</button>
-    </div>
-  </section>
-
   <section class="actions">
-    <button data-scope="reply" class="row"><span>Read last reply</span><kbd>Alt+Shift+L</kbd></button>
-    <button data-scope="page" class="row"><span>Read this tab</span><kbd>Alt+Shift+A</kbd></button>
-    <button data-scope="selection" class="row"><span>Read selection</span><kbd>⌥⇧R anywhere</kbd></button>
+    <button data-scope="page" class="row"><span>Read this tab</span></button>
     <button data-scope="pick" class="row"><span>Pick an element</span><kbd>click it</kbd></button>
+    <div class="row hint"><span>Read a selection</span><kbd>⌥⇧R anywhere</kbd></div>
   </section>
 
   <section class="card">
-    <label class="check"><input id="auto-chatgpt" type="checkbox"><span>Read new ChatGPT replies automatically</span></label>
-    <label class="check"><input id="auto-claude" type="checkbox"><span>Read new Claude replies automatically</span></label>
     <label class="check"><input id="show-pill" type="checkbox"><span>Show the floating button on pages</span></label>
   </section>
 
-  <section class="card">
-    <textarea id="text" rows="3" placeholder="Paste text to read, or drop a file here"></textarea>
-    <div class="row-actions">
-      <button id="speak" class="primary">Read text</button>
-      <label class="file">File<input id="file" type="file" accept=".txt,.md,.markdown"></label>
-    </div>
-  </section>
-
   <footer>
-    <span>Voice and speed: Talk to Me → Settings → Sources → Browser</span>
+    <span>Pause, skip and stop: the bar on the page, or the Talk to Me menu</span>
   </footer>
 
   <script src="popup.js"></script>

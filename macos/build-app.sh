@@ -24,6 +24,27 @@ cp "$OUT/bin/talktome" "$APP/Contents/Resources/talktome"
 # agent integrations, found by `talktome install` next to the CLI
 cp -R "$ROOT/integrations" "$APP/Contents/Resources/integrations"
 
-# ad-hoc signature (Developer ID signing and notarization come in Phase 6)
-codesign --force --deep --sign - "$APP" >/dev/null
-echo "built $APP"
+# Signing. macOS keys Accessibility (and other privacy) permissions to the
+# code signature. An ad-hoc signature changes on every build, so macOS treats
+# each build as a new app and the permission stops matching. A stable
+# identity keeps it across rebuilds. Order: $TALKTOME_SIGN_IDENTITY, a
+# "Talk to Me Dev" self-signed certificate, an "Apple Development"
+# certificate (free with an Apple ID in Xcode), else ad hoc.
+IDENTITY="${TALKTOME_SIGN_IDENTITY:-}"
+if [ -z "$IDENTITY" ]; then
+    IDS=$(security find-identity -v -p codesigning 2>/dev/null || true)
+    for name in "Talk to Me Dev" "Apple Development"; do
+        line=$(printf '%s\n' "$IDS" | grep -m1 "\"$name" || true)
+        if [ -n "$line" ]; then
+            IDENTITY=$(printf '%s\n' "$line" | awk '{print $2}')
+            break
+        fi
+    done
+fi
+if [ -n "$IDENTITY" ]; then
+    codesign --force --deep --sign "$IDENTITY" "$APP" >/dev/null
+    echo "built $APP (signed with $IDENTITY)"
+else
+    codesign --force --deep --sign - "$APP" >/dev/null
+    echo "built $APP (ad hoc: macOS may ask for Accessibility again after each build)"
+fi

@@ -9,6 +9,7 @@
 #ifndef TALK_H
 #define TALK_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -39,6 +40,12 @@ int32_t talk_start(const char * home, talk_event_cb cb, void * user);
 char *  talk_call(const char * method, const char * path, const char * body, int32_t * status);
 
 void    talk_free(char * p);
+
+// A recorded answer to "Want the full report?" (mono float PCM). Transcribed
+// with the local recognizer chosen in Briefing settings and acted on. Returns
+// {"transcript": "...", "answer": "yes"|"no"|null} or {"error": "..."}; free
+// with talk_free. Call it off the main thread (it can take a second).
+char *  talk_answer_audio(const float * pcm, size_t n_samples, int32_t sample_rate);
 
 #ifdef __cplusplus
 }

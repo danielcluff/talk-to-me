@@ -77,6 +77,21 @@ void         te_llm_free(te_llm * llm);
 int32_t      te_llm_generate(te_llm * llm, const char * user_message, int32_t max_tokens,
                              char * out, size_t out_size, char * err, size_t err_size);
 
+// ---------------------------------------------------------------- speech recognition
+// A speech model with an audio projector (Qwen3-ASR, Voxtral): mono float
+// PCM at te_asr_sample_rate() in, the transcript out.
+
+typedef struct te_asr te_asr;
+
+te_asr *     te_asr_load(const char * model_path, const char * mmproj_path, int32_t use_gpu, char * err, size_t err_size);
+void         te_asr_free(te_asr * asr);
+int32_t      te_asr_sample_rate(const te_asr * asr);
+
+// hint: words likely to be said (passed as context to models that take it).
+// Returns the transcript length (NUL terminated in `out`), or -1 on error.
+int32_t      te_asr_transcribe(te_asr * asr, const float * pcm, size_t n_samples, const char * hint,
+                               char * out, size_t out_size, char * err, size_t err_size);
+
 #ifdef __cplusplus
 }
 #endif

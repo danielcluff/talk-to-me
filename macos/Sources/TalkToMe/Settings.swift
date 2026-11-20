@@ -659,7 +659,11 @@ struct BriefingPage: View {
             }
             Picker("Recognizer", selection: Binding(get: { b.recognizer }, set: { core.updateBriefing(["recognizer": $0]) })) {
                 Text("Apple, on this Mac (no download)").tag("apple")
+                ForEach(core.models.filter { $0.kind == "listening" && $0.installed }) { m in
+                    Text("\(m.name) (local)").tag(m.id)
+                }
             }
+            Text("Local recognizers are downloaded on the Models page, under Listening.").font(.callout).foregroundStyle(.secondary)
             HStack {
                 Text("Yes words")
                 TextField("", text: $yesWords).onSubmit { saveWords() }

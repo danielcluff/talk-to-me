@@ -124,3 +124,23 @@ export fn talk_call(method_c: [*:0]const u8, path_c: [*:0]const u8, body_c: ?[*:
 export fn talk_free(p: ?[*:0]u8) void {
     if (p) |ptr| std.heap.c_allocator.free(std.mem.span(ptr));
 }
+
+/// The app recorded an answer to "Want the full report?": transcribe it with
+/// the local recognizer, act on it, and return {"transcript": ..., "answer":
+/// "yes"|"no"|null} (free with talk_free), or an {"error": ...}.
+export fn talk_answer_audio(pcm: [*]const f32, n_samples: usize, sample_rate: i32) ?[*:0]u8 {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const reply: []const u8 = blk: {
+        if (!started.load(.acquire)) break :blk "{\"error\":\"talk_start has not been called\"}";
+        const heard = srv.core.answerFromAudio(a, pcm[0..n_samples], @intCast(sample_rate)) catch |err|
+            break :blk std.fmt.allocPrint(a, "{{\"error\":\"{t}\"}}", .{err}) catch "{\"error\":\"internal\"}";
+        break :blk std.json.Stringify.valueAlloc(a, .{
+            .transcript = heard.transcript,
+            .answer = if (heard.answer) |v| @as(?[]const u8, if (v) "yes" else "no") else null,
+        }, .{}) catch "{\"error\":\"internal\"}";
+    };
+    const out = std.heap.c_allocator.dupeSentinel(u8, reply, 0) catch return null;
+    return out.ptr;
+}

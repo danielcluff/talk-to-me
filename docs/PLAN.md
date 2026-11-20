@@ -1043,6 +1043,89 @@ recognizers):
 *Later (not planned yet):* actions beyond reading from a briefing, such as
 "open that tab in herdr" or "reply to Codex".
 
+**Phase 7 results (2026-11-19)**
+
+Built, in four stages:
+
+*A. The briefing flow (core).*
+- **Request kinds:** hooks send `reply`, MCP sends `message`, everything else
+  is `read`.
+- **Only replies get briefed:** a `reply` over `min_words`, from a source
+  with Brief me on, becomes a briefing.
+- **The summarizer worker** writes "<Agent>, in <project>. <summary> Want the
+  full report?". If it fails or times out, it reads the first paragraph
+  instead.
+- **The hold:** after a briefing, the queue holds for `listen_seconds`. A yes
+  reads the full report next; a no or a timeout releases the queue. The last
+  report can always be read again.
+- **API:** `/v1/briefing/answer|last|test|status|answer-audio`. **CLI:**
+  `talktome answer yes|no`, `talktome report`.
+
+*Backends.*
+- **CLI backends:**
+  - Codex: `codex exec --ephemeral -s read-only -o <file> -m <model> -`
+  - Claude Code: `claude -p --tools "" --no-session-persistence`
+  - OpenCode: `opencode run -m …`
+- **Ollama:** `/api/chat`.
+- **How they're run:** in an empty work folder, found through the usual
+  install folders and then the login shell (an app from Finder gets a minimal
+  PATH), with a timeout.
+- **The loop guard:** `TALKTOME_SUPPRESS=1` makes our own hooks stand down,
+  since a summarizer is itself an agent with our Stop hook installed.
+- **Local:** `te_llm_*` in the engine shim (chat template, thinking off) with
+  Qwen3 0.6B, 1.7B or 4B, or Gemma 3 1B or 4B. They load on demand and unload
+  when idle.
+
+*B. App.*
+- **Briefing settings page:** on/off (default off), backend and model, where
+  reports go, length, timeout, listen window, yes and no words, and a Test
+  button.
+- **Per-agent "Brief me"** on the Sources page.
+- **Menu:** the question with Yes and No buttons, "Summarizing…", and a mic
+  icon while listening.
+- **⌥⇧R answers yes** while a question waits. There's also a "Read Last Full
+  Report" item and hotkey.
+- **Permissions:** microphone and speech recognition.
+
+*C. Models page.*
+- Grouped by kind: Voices, Summaries, Listening.
+- Each model shows its folder, files, size on disk, and Show in Finder.
+- Unfinished downloads appear with Remove, and the page shows total disk use.
+- Use and Delete work per kind. Deleting the summarizer in use turns
+  briefings off rather than falling back to a cloud tool.
+
+*D. Listening.*
+- **Apple on-device recognition** (`SFSpeechRecognizer` with
+  `requiresOnDeviceRecognition`) by default, only during the window.
+- **Local recognizers:** Qwen3-ASR 0.6B or 1.7B, or Voxtral Mini 3B, through
+  `te_asr_*` (llama.cpp's transcription preset, with the yes and no words as
+  hints).
+- The app records the window at 16 kHz and calls `talk_answer_audio`. The
+  core transcribes, matches the words and answers.
+- The recognizer preloads while the summary is being written, and local
+  recognizers get 3 s of grace after the window.
+
+Measured on this M4:
+- **Codex `gpt-6-luna`:** summaries in 5.6–6.3 s, of good quality: it leads
+  with the outcome and surfaces the agent's question.
+- **Qwen3 1.7B local:** 1.07 s including the load. The writing is plainer and
+  ignores some style rules.
+- **Qwen3-ASR 0.6B:** transcribed "Yes, please read it." (0.88 s including
+  the load), "No thanks." (0.19 s) and "What time is it?" (no answer)
+  exactly.
+
+Verified:
+- With Luna: yes, no, timeout, a short reply read in full, and the hook
+  guard.
+- A full voice answer: a spoken "yes" clip through the local recognizer read
+  the full report.
+- The Swift matcher: 10 phrasing cases.
+- Partial-download cleanup, and deleting the summarizer in use.
+
+Not verified:
+- Talking into the real microphone (with Apple's or a local recognizer).
+- The new Settings pages by eye.
+
 ---
 
 ## 11. Repo layout

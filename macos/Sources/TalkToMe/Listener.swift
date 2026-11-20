@@ -1,4 +1,5 @@
 import AVFoundation
+import CTalk
 import Foundation
 import Speech
 
@@ -74,7 +75,62 @@ final class Listener {
         }
     }
 
+    /// Record `seconds` of 16 kHz mono audio for a local recognizer, then
+    /// hand it to the core (talk_answer_audio), which transcribes and answers.
+    func record(seconds: Int, onDone: @escaping @MainActor (String?) -> Void) {
+        stop()
+        guard Self.micAuthorized() else { return }
+        let input = engine.inputNode
+        let inFormat = input.outputFormat(forBus: 0)
+        guard let outFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false),
+              let converter = AVAudioConverter(from: inFormat, to: outFormat) else { return }
+        let collected = SampleBuffer()
+        input.removeTap(onBus: 0)
+        input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { buffer, _ in
+            let capacity = AVAudioFrameCount(Double(buffer.frameLength) * 16000 / inFormat.sampleRate) + 32
+            guard let out = AVAudioPCMBuffer(pcmFormat: outFormat, frameCapacity: capacity) else { return }
+            var fed = false
+            var error: NSError?
+            converter.convert(to: out, error: &error) { _, status in
+                if fed {
+                    status.pointee = .noDataNow
+                    return nil
+                }
+                fed = true
+                status.pointee = .haveData
+                return buffer
+            }
+            if let ch = out.floatChannelData?[0] {
+                collected.append(UnsafeBufferPointer(start: ch, count: Int(out.frameLength)))
+            }
+        }
+        engine.prepare()
+        do { try engine.start() } catch {
+            stop()
+            return
+        }
+        recording = true
+        timer = Timer.scheduledTimer(withTimeInterval: TimeInterval(seconds), repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.recording else { return }
+                self.stop()
+                let samples = collected.take()
+                let heard: String? = await Task.detached {
+                    guard !samples.isEmpty else { return nil }
+                    let reply = samples.withUnsafeBufferPointer { talk_answer_audio($0.baseAddress, $0.count, 16000) }
+                    guard let reply else { return nil }
+                    defer { talk_free(reply) }
+                    return String(cString: reply)
+                }.value
+                onDone(heard)
+            }
+        }
+    }
+
+    private var recording = false
+
     func stop() {
+        recording = false
         timer?.invalidate()
         timer = nil
         if engine.isRunning {
@@ -97,5 +153,25 @@ final class Listener {
         if no.contains(where: has) { return false }
         if yes.contains(where: has) { return true }
         return nil
+    }
+}
+
+/// Samples collected on the audio thread, read once on the main actor.
+final class SampleBuffer: @unchecked Sendable {
+    private var samples: [Float] = []
+    private let lock = NSLock()
+
+    func append(_ chunk: UnsafeBufferPointer<Float>) {
+        lock.lock()
+        samples.append(contentsOf: chunk)
+        lock.unlock()
+    }
+
+    func take() -> [Float] {
+        lock.lock()
+        defer { lock.unlock() }
+        let out = samples
+        samples = []
+        return out
     }
 }

@@ -27,6 +27,8 @@ pub const Server = struct {
     /// the port; the app's in-process server ignores it.
     allow_shutdown: bool = false,
     pairing: Pairing = .{},
+    /// sample rate of the current /v1/briefing/answer-audio request (from ?rate=)
+    answer_audio_rate: u32 = 16000,
 };
 
 /// Browser extension pairing. An extension asks (POST /v1/pair, from an
@@ -227,6 +229,14 @@ fn handle(s: *Server, req: *http.Server.Request, a: std.mem.Allocator) !void {
     if (method.requestHasBody() and declared) {
         ex.body = readBody(req, a, 4 << 20) catch return respondError(req, a, .payload_too_large, "body too large");
     }
+    if (std.mem.endsWith(u8, path, "/answer-audio")) {
+        s.answer_audio_rate = 16000;
+        if (std.mem.indexOf(u8, target, "rate=")) |i| {
+            var v = target[i + 5 ..];
+            if (std.mem.indexOfScalar(u8, v, '&')) |amp| v = v[0..amp];
+            s.answer_audio_rate = std.fmt.parseInt(u32, v, 10) catch 16000;
+        }
+    }
     try dispatch(s, &ex, a, method, path);
     try req.respond(ex.reply, .{
         .status = ex.status,
@@ -302,6 +312,15 @@ fn briefingRoute(s: *Server, req: *Exchange, a: std.mem.Allocator, method: http.
         if (!yes and !std.ascii.eqlIgnoreCase(b.answer, "no")) return sendError(req, a, .bad_request, "answer must be yes or no");
         const r = try s.core.answer(yes);
         return sendJson(req, a, if (r == .no_question) .conflict else .ok, .{ .result = @tagName(r) });
+    }
+    if (std.mem.eql(u8, action, "answer-audio")) {
+        // body: little-endian float32 mono samples; ?rate=16000
+        const rate = s.answer_audio_rate;
+        if (req.body.len < 4 or req.body.len % 4 != 0) return sendError(req, a, .bad_request, "body must be float32 samples");
+        const samples = try a.alloc(f32, req.body.len / 4);
+        for (samples, 0..) |*o, i| o.* = @bitCast(std.mem.readInt(u32, req.body[i * 4 ..][0..4], .little));
+        const heard = s.core.answerFromAudio(a, samples, rate) catch |err| return sendError(req, a, .unprocessable_entity, @errorName(err));
+        return sendJson(req, a, .ok, .{ .transcript = heard.transcript, .answer = if (heard.answer) |v| @as(?[]const u8, if (v) "yes" else "no") else null });
     }
     if (std.mem.eql(u8, action, "last")) {
         if (!try s.core.readLastReport()) return sendError(req, a, .not_found, "no report yet");

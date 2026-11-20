@@ -263,6 +263,10 @@ pub const Core = struct {
     brief_thread: ?std.Thread = null,
     hold: ?Hold = null,
     last_report: ?Report = null,
+    // local speech recognizer for answers, guarded by asr_mu (never take mu inside)
+    asr_mu: Mutex = .{},
+    asr: ?*c.te_asr = null,
+    asr_id: []const u8 = "",
     // local summary model, owned by the brief thread
     llm: ?*c.te_llm = null,
     llm_id: []const u8 = "",
@@ -295,6 +299,7 @@ pub const Core = struct {
         if (self.engine_thread) |t| t.join();
         if (self.brief_thread) |t| t.join();
         if (self.llm) |l| c.te_llm_free(l);
+        if (self.asr) |r| c.te_asr_free(r);
         for (self.brief_tasks.items) |t| {
             t.arena.deinit();
             self.gpa.destroy(t);
@@ -531,7 +536,9 @@ pub const Core = struct {
             if (ask) {
                 // "Want the full report?": hold the queue for the answer
                 const secs = @max(self.settings.briefing.listen_seconds, 1);
-                self.hold = .{ .job = j.id, .deadline_ms = monoMs() + @as(i64, secs) * 1000 + 500 };
+                // a local recognizer transcribes after the window closes; give it time
+                const grace: i64 = if (std.mem.eql(u8, self.settings.briefing.recognizer, "apple")) 500 else 3000;
+                self.hold = .{ .job = j.id, .deadline_ms = monoMs() + @as(i64, secs) * 1000 + grace };
                 self.pushEvent(.{ .kind = .ask, .job = j.id, .index = secs });
                 self.work_cv.signal();
                 return;
@@ -1220,6 +1227,8 @@ pub const Core = struct {
             .home = home,
             .workdir = std.fs.path.join(a, &.{ self.paths.root, "briefing" }) catch "/tmp",
         };
+        // warm a local recognizer now, so the answer window doesn't wait for it
+        self.preloadRecognizer();
         const started = monoMs();
         var ok = true;
         const summary = (if (cfg.backend == .local) self.summarizeLocal(a, cfg.model, t.text) else briefing.summarize(a, self.io, env, cfg, t.text)) catch |err| blk: {
@@ -1297,6 +1306,129 @@ pub const Core = struct {
         const cleaned = try briefing.clean(a, out[0..@intCast(n)]);
         if (cleaned.len == 0) return error.EmptySummary;
         return cleaned;
+    }
+
+    // ------------------------------------------------------------ answers by voice
+
+    fn recognizerId(self: *Core, a: std.mem.Allocator) ![]const u8 {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return a.dupe(u8, self.settings.briefing.recognizer);
+    }
+
+    /// Load the chosen local recognizer if it isn't loaded (caller holds asr_mu).
+    fn ensureAsr(self: *Core, a: std.mem.Allocator, id: []const u8) !*c.te_asr {
+        if (self.asr) |r| if (std.mem.eql(u8, self.asr_id, id)) return r;
+        const m = self.catalog.find(id) orelse return error.UnknownRecognizer;
+        if (m.kind != .listening) return error.NotARecognizer;
+        const lp = try models.localPaths(a, self.paths.models, m.*);
+        if (!models.isInstalled(self.io, lp, m.*)) return error.RecognizerNotInstalled;
+        if (self.asr) |r| c.te_asr_free(r);
+        self.asr = null;
+        var err: [256]u8 = @splat(0);
+        self.asr = c.te_asr_load(lp.model.ptr, lp.mmproj.ptr, 1, &err, err.len) orelse {
+            log.err("recognizer: {s}", .{std.mem.sliceTo(&err, 0)});
+            return error.RecognizerLoadFailed;
+        };
+        self.asr_id = m.id;
+        log.info("loaded recognizer {s}", .{m.id});
+        return self.asr.?;
+    }
+
+    fn preloadRecognizer(self: *Core) void {
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        const id = self.recognizerId(arena.allocator()) catch return;
+        if (std.mem.eql(u8, id, "apple")) return;
+        self.asr_mu.lock();
+        defer self.asr_mu.unlock();
+        _ = self.ensureAsr(arena.allocator(), id) catch {};
+    }
+
+    /// Whole-word match; "no" words win when both appear (same rules as the app).
+    pub fn matchAnswer(a: std.mem.Allocator, heard: []const u8, yes: []const []const u8, no: []const []const u8) !?bool {
+        var norm: std.ArrayList(u8) = .empty;
+        try norm.append(a, ' ');
+        var prev_space = true;
+        for (heard) |ch| {
+            if (std.ascii.isAlphabetic(ch)) {
+                try norm.append(a, std.ascii.toLower(ch));
+                prev_space = false;
+            } else if (!prev_space) {
+                try norm.append(a, ' ');
+                prev_space = true;
+            }
+        }
+        if (!prev_space) try norm.append(a, ' ');
+        const text = norm.items;
+        const has = struct {
+            fn f(al: std.mem.Allocator, t: []const u8, phrase: []const u8) !bool {
+                const p = std.mem.trim(u8, phrase, " ");
+                if (p.len == 0) return false;
+                const needle = try std.fmt.allocPrint(al, " {s} ", .{p});
+                _ = std.ascii.lowerString(needle, needle);
+                return std.mem.indexOf(u8, t, needle) != null;
+            }
+        }.f;
+        for (no) |w| if (try has(a, text, w)) return false;
+        for (yes) |w| if (try has(a, text, w)) return true;
+        return null;
+    }
+
+    pub const HeardAnswer = struct { transcript: []const u8, answer: ?bool };
+
+    /// Transcribe a recorded answer with the local recognizer and act on it.
+    pub fn answerFromAudio(self: *Core, a: std.mem.Allocator, pcm: []const f32, rate: u32) !HeardAnswer {
+        const s = blk: {
+            self.mu.lock();
+            defer self.mu.unlock();
+            break :blk try dupeSettings(a, self.settings);
+        };
+        const id = s.briefing.recognizer;
+        if (std.mem.eql(u8, id, "apple")) return error.NoLocalRecognizer;
+
+        // the expected words, as context for recognizers that take it
+        const all_words = try std.mem.concat(a, []const u8, &.{ s.briefing.yes_words, s.briefing.no_words });
+        const hint_all = try std.mem.joinZ(a, ", ", all_words);
+
+        var transcript: []const u8 = "";
+        {
+            self.asr_mu.lock();
+            defer self.asr_mu.unlock();
+            const asr = try self.ensureAsr(a, id);
+            const want: u32 = @intCast(c.te_asr_sample_rate(asr));
+            const samples = if (want == rate or want == 0) pcm else try resample(a, pcm, rate, want);
+            const out = try a.alloc(u8, 1024);
+            var err: [256]u8 = @splat(0);
+            const n = c.te_asr_transcribe(asr, samples.ptr, samples.len, hint_all.ptr, out.ptr, out.len, &err, err.len);
+            if (n < 0) {
+                log.err("recognizer: {s}", .{std.mem.sliceTo(&err, 0)});
+                return error.TranscriptionFailed;
+            }
+            transcript = out[0..@intCast(n)];
+            // Qwen3-ASR prefixes "language English<asr_text>"
+            if (std.mem.lastIndexOf(u8, transcript, "<asr_text>")) |i| transcript = transcript[i + "<asr_text>".len ..];
+            transcript = std.mem.trim(u8, transcript, " \t\r\n");
+        }
+        const verdict = try matchAnswer(a, transcript, s.briefing.yes_words, s.briefing.no_words);
+        log.info("heard \"{s}\" -> {s}", .{ transcript, if (verdict) |v| (if (v) "yes" else "no") else "no answer" });
+        if (verdict) |v| _ = try self.answer(v);
+        return .{ .transcript = transcript, .answer = verdict };
+    }
+
+    fn resample(a: std.mem.Allocator, pcm: []const f32, from: u32, to: u32) ![]f32 {
+        const n_out: usize = @intCast(@as(u64, pcm.len) * to / from);
+        const out = try a.alloc(f32, n_out);
+        const step = @as(f64, @floatFromInt(from)) / @as(f64, @floatFromInt(to));
+        for (out, 0..) |*o, i| {
+            const x = @as(f64, @floatFromInt(i)) * step;
+            const k: usize = @intFromFloat(x);
+            const frac: f32 = @floatCast(x - @as(f64, @floatFromInt(k)));
+            const s0 = pcm[@min(k, pcm.len - 1)];
+            const s1 = pcm[@min(k + 1, pcm.len - 1)];
+            o.* = s0 + (s1 - s0) * frac;
+        }
+        return out;
     }
 
     /// Release the held queue (caller holds mu).

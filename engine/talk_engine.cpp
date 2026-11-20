@@ -459,4 +459,149 @@ int32_t te_llm_generate(te_llm * llm, const char * user_message, int32_t max_tok
     }
 }
 
+// ---------------------------------------------------------------- speech recognition
+
+struct te_asr {
+    llama_model *             model = nullptr;
+    const llama_vocab *       vocab = nullptr;
+    mtmd::context_ptr         mctx;
+    common_chat_templates_ptr tmpls;
+};
+
+te_asr * te_asr_load(const char * model_path, const char * mmproj_path, int32_t use_gpu, char * err, size_t err_size) {
+    if (!model_path || !mmproj_path) {
+        set_err(err, err_size, "model_path and mmproj_path are required");
+        return nullptr;
+    }
+    static bool backend_ready = false;
+    if (!backend_ready) {
+        llama_log_set(log_cb, nullptr);
+        mtmd_helper_log_set(log_cb, nullptr);
+        llama_backend_init();
+        backend_ready = true;
+    }
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = use_gpu ? 999 : 0;
+    llama_model * model = llama_model_load_from_file(model_path, mp);
+    if (!model) {
+        set_err(err, err_size, "failed to load %s", model_path);
+        return nullptr;
+    }
+    auto * asr = new te_asr();
+    asr->model = model;
+    asr->vocab = llama_model_get_vocab(model);
+    mtmd_context_params cp = mtmd_context_params_default();
+    cp.use_gpu = use_gpu != 0;
+    asr->mctx.reset(mtmd_init_from_file(mmproj_path, model, cp));
+    if (!asr->mctx || !mtmd_support_audio(asr->mctx.get())) {
+        set_err(err, err_size, "%s is not an audio projector", mmproj_path);
+        te_asr_free(asr);
+        return nullptr;
+    }
+    try {
+        asr->tmpls = common_chat_templates_init(model, "");
+    } catch (const std::exception & ex) {
+        set_err(err, err_size, "chat template: %s", ex.what());
+        te_asr_free(asr);
+        return nullptr;
+    }
+    return asr;
+}
+
+void te_asr_free(te_asr * asr) {
+    if (!asr) return;
+    asr->mctx.reset();
+    if (asr->model) llama_model_free(asr->model);
+    delete asr;
+}
+
+int32_t te_asr_sample_rate(const te_asr * asr) {
+    return asr ? mtmd_get_audio_sample_rate(asr->mctx.get()) : 0;
+}
+
+int32_t te_asr_transcribe(te_asr * asr, const float * pcm, size_t n_samples, const char * hint,
+                          char * out, size_t out_size, char * err, size_t err_size) {
+    if (!asr || !pcm || n_samples == 0 || !out || out_size == 0) {
+        set_err(err, err_size, "bad arguments");
+        return -1;
+    }
+    out[0] = 0;
+    llama_context * ctx = nullptr;
+    llama_sampler * smpl = nullptr;
+    llama_batch_ext * batch = nullptr;
+    mtmd_input_chunks * chunks = nullptr;
+    mtmd_bitmap * bitmap = nullptr;
+    int32_t rc = 0;
+    try {
+        // the model's transcription prompt, with hint words where the model takes them
+        const double seconds = (double) n_samples / (double) mtmd_get_audio_sample_rate(asr->mctx.get());
+        const std::string hints = hint ? hint : "";
+        common_chat_prompt_preset preset = common_chat_get_asr_prompt(asr->tmpls.get(), "en", 0.0, hints);
+        if (preset.needs_audio_length) preset = common_chat_get_asr_prompt(asr->tmpls.get(), "en", seconds, hints);
+        if (!preset.has_context && !hints.empty()) {
+            preset = common_chat_get_asr_prompt(asr->tmpls.get(), "en", preset.needs_audio_length ? seconds : 0.0, "");
+        }
+        const std::string marker = mtmd_default_marker();
+        const std::string user = preset.media_first ? marker + preset.user : preset.user + marker;
+
+        common_chat_templates_inputs inputs;
+        if (!preset.system.empty()) {
+            common_chat_msg sys;
+            sys.role = "system";
+            sys.content = preset.system;
+            inputs.messages.push_back(sys);
+        }
+        common_chat_msg msg;
+        msg.role = "user";
+        msg.content = user;
+        inputs.messages.push_back(msg);
+        inputs.add_generation_prompt = true;
+        inputs.use_jinja = true;
+        inputs.enable_thinking = false;
+        const std::string prompt = common_chat_templates_apply(asr->tmpls.get(), inputs).prompt.str();
+
+        llama_context_params lp = llama_context_default_params();
+        lp.n_ctx = 4096;
+        lp.n_batch = 2048;
+        lp.no_perf = true;
+        ctx = llama_init_from_model(asr->model, lp);
+        if (!ctx) throw std::runtime_error("failed to create a context");
+
+        bitmap = mtmd_bitmap_init_from_audio(n_samples, pcm);
+        chunks = mtmd_input_chunks_init();
+        mtmd_input_text text{ prompt.c_str(), prompt.size(), true, true };
+        const mtmd_bitmap * bitmaps[] = { bitmap };
+        if (mtmd_tokenize(asr->mctx.get(), chunks, &text, bitmaps, 1) != 0) throw std::runtime_error("tokenize failed");
+        llama_pos n_past = 0;
+        if (mtmd_helper_eval_chunks(asr->mctx.get(), ctx, chunks, 0, 0, (int32_t) lp.n_batch, true, &n_past) != 0) {
+            throw std::runtime_error("audio evaluation failed");
+        }
+
+        smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+        batch = llama_batch_ext_init(ctx);
+        std::string transcript;
+        for (int i = 0; i < 64; ++i) {
+            const llama_token t = llama_sampler_sample(smpl, ctx, -1);
+            if (llama_vocab_is_eog(asr->vocab, t)) break;
+            transcript += common_token_to_piece(asr->vocab, t, false);
+            llm_batch(batch, &t, 1, n_past++);
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch) != 0) throw std::runtime_error("decode failed");
+        }
+        const size_t n = std::min(transcript.size(), out_size - 1);
+        memcpy(out, transcript.data(), n);
+        out[n] = 0;
+        rc = (int32_t) n;
+    } catch (const std::exception & ex) {
+        set_err(err, err_size, "transcription failed: %s", ex.what());
+        rc = -1;
+    }
+    if (batch) llama_batch_ext_free(batch);
+    if (smpl) llama_sampler_free(smpl);
+    if (chunks) mtmd_input_chunks_free(chunks);
+    if (bitmap) mtmd_bitmap_free(bitmap);
+    if (ctx) llama_free(ctx);
+    return rc;
+}
+
 } // extern "C"

@@ -295,6 +295,12 @@ final class TalkCore: ObservableObject {
                 Listener.shared.listen(seconds: e.index ?? b.listen_seconds, yes: b.yes_words, no: b.no_words) { [weak self] yes in
                     self?.answer(yes)
                 }
+            } else if b.listen {
+                // a local recognizer: record the window, the core transcribes and answers
+                listening = true
+                Listener.shared.record(seconds: e.index ?? b.listen_seconds) { [weak self] _ in
+                    self?.listening = false
+                }
             }
             return
         case "answered":

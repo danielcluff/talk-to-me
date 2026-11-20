@@ -254,6 +254,7 @@ pub fn dispatch(s: *Server, ex: *Exchange, a: std.mem.Allocator, method: http.Me
         return sendJson(req, a, .ok, .{ .ok = true });
     }
     if (std.mem.startsWith(u8, path, "/v1/pair")) return pairAdmin(s, req, a, method, path);
+    if (std.mem.startsWith(u8, path, "/v1/briefing/")) return briefingRoute(s, req, a, method, path["/v1/briefing/".len..]);
     if (method == .POST and std.mem.eql(u8, path, "/v1/speak")) return speak(s, req, a);
     if (method == .POST and std.mem.eql(u8, path, "/v1/speak/file")) return speakFile(s, req, a);
     if (method == .GET and std.mem.eql(u8, path, "/v1/jobs")) return sendJson(req, a, .ok, .{ .jobs = try s.core.jobViews(a) });
@@ -282,6 +283,49 @@ pub fn dispatch(s: *Server, ex: *Exchange, a: std.mem.Allocator, method: http.Me
     }
     if (method == .GET and std.mem.eql(u8, path, "/v1/settings")) return sendJson(req, a, .ok, try s.core.getSettings(a));
     if (method == .PATCH and std.mem.eql(u8, path, "/v1/settings")) return patchSettings(s, req, a);
+    return sendError(req, a, .not_found, "not found");
+}
+
+/// POST /v1/briefing/answer {"answer": "yes"|"no"}: answer "Want the full report?"
+/// POST /v1/briefing/last: read the full report behind the latest briefing.
+/// POST /v1/briefing/test {"text"?}: brief a sample report now (Settings → Test).
+/// GET  /v1/briefing/status: whether a question is waiting for an answer.
+fn briefingRoute(s: *Server, req: *Exchange, a: std.mem.Allocator, method: http.Method, action: []const u8) !void {
+    if (method == .GET and std.mem.eql(u8, action, "status")) {
+        return sendJson(req, a, .ok, .{ .awaiting_answer = s.core.awaitingAnswer() });
+    }
+    if (method != .POST) return sendError(req, a, .not_found, "not found");
+    if (std.mem.eql(u8, action, "answer")) {
+        const B = struct { answer: []const u8 = "" };
+        const b = std.json.parseFromSliceLeaky(B, a, req.body, .{ .ignore_unknown_fields = true }) catch B{};
+        const yes = std.ascii.eqlIgnoreCase(b.answer, "yes");
+        if (!yes and !std.ascii.eqlIgnoreCase(b.answer, "no")) return sendError(req, a, .bad_request, "answer must be yes or no");
+        const r = try s.core.answer(yes);
+        return sendJson(req, a, if (r == .no_question) .conflict else .ok, .{ .result = @tagName(r) });
+    }
+    if (std.mem.eql(u8, action, "last")) {
+        if (!try s.core.readLastReport()) return sendError(req, a, .not_found, "no report yet");
+        return sendJson(req, a, .ok, .{ .ok = true });
+    }
+    if (std.mem.eql(u8, action, "test")) {
+        const B = struct { text: ?[]const u8 = null };
+        const b = std.json.parseFromSliceLeaky(B, a, req.body, .{ .ignore_unknown_fields = true }) catch B{};
+        const sample =
+            \\I refactored the markdown parser so headings, lists and links are read naturally, and code blocks are announced instead of read.
+            \\
+            \\All 18 unit tests pass, and I added four new ones for the pronunciation dictionary. The build is clean.
+            \\
+            \\One thing needs you: the History page keeps 50 items. Should I make that a setting, or keep the fixed limit?
+        ;
+        const result = try s.core.speak(.{
+            .kind = .reply,
+            .force_brief = true,
+            .text = b.text orelse sample,
+            .source = .{ .app = "codex", .label = "a sample report" },
+            .policy = .interrupt,
+        });
+        return respondSpeak(req, a, result);
+    }
     return sendError(req, a, .not_found, "not found");
 }
 
@@ -325,6 +369,7 @@ fn jobIdStr(a: std.mem.Allocator, id: u64) ![]const u8 {
 }
 
 const SpeakBody = struct {
+    kind: core_mod.Kind = .read,
     text: ?[]const u8 = null,
     chunks: ?[]const []const u8 = null,
     format: core_mod.Format = .markdown,
@@ -338,6 +383,7 @@ fn respondSpeak(req: *Exchange, a: std.mem.Allocator, result: core_mod.SpeakResu
     switch (result) {
         .queued => |q| try sendJson(req, a, .accepted, .{ .job_id = try jobIdStr(a, q.id), .chunks = q.chunks, .position = q.position }),
         .dropped => |reason| try sendJson(req, a, .ok, .{ .dropped = reason }),
+        .summarizing => try sendJson(req, a, .accepted, .{ .summarizing = true }),
     }
 }
 
@@ -347,7 +393,13 @@ fn speak(s: *Server, req: *Exchange, a: std.mem.Allocator) !void {
         return sendError(req, a, .bad_request, "invalid JSON body");
     if (parsed.text == null and parsed.chunks == null) return sendError(req, a, .bad_request, "text or chunks required");
     if (parsed.speed) |sp| if (!(sp >= 0.25 and sp <= 4.0)) return sendError(req, a, .bad_request, "speed must be 0.25-4");
+    // briefing and report are internal kinds
+    const kind: core_mod.Kind = switch (parsed.kind) {
+        .briefing, .report => .read,
+        else => parsed.kind,
+    };
     const result = s.core.speak(.{
+        .kind = kind,
         .text = parsed.text,
         .chunks = parsed.chunks,
         .format = parsed.format,
@@ -439,6 +491,7 @@ const SettingsPatch = struct {
     dedupe_seconds: ?u32 = null,
     /// replaces the whole list
     dictionary: ?[]const config.DictionaryEntry = null,
+    briefing: ?BriefingPatch = null,
     /// merged per source: {"sources": {"codex": {"voice": "am_michael"}}}
     sources: ?std.json.ArrayHashMap(SourcePatch) = null,
 };
@@ -447,6 +500,21 @@ const SourcePatch = struct {
     enabled: ?bool = null,
     voice: ?[]const u8 = null,
     announce: ?bool = null,
+    brief: ?bool = null,
+};
+
+const BriefingPatch = struct {
+    enabled: ?bool = null,
+    backend: ?@import("briefing.zig").Backend = null,
+    model: ?[]const u8 = null,
+    ollama_url: ?[]const u8 = null,
+    min_words: ?u32 = null,
+    timeout_seconds: ?u32 = null,
+    listen: ?bool = null,
+    listen_seconds: ?u32 = null,
+    recognizer: ?[]const u8 = null,
+    yes_words: ?[]const []const u8 = null,
+    no_words: ?[]const []const u8 = null,
 };
 
 fn patchSettings(s: *Server, req: *Exchange, a: std.mem.Allocator) !void {
@@ -469,6 +537,20 @@ fn patchSettings(s: *Server, req: *Exchange, a: std.mem.Allocator) !void {
     if (patch.tables) |v| settings.tables = v;
     if (patch.dedupe_seconds) |v| settings.dedupe_seconds = v;
     if (patch.dictionary) |d| settings.dictionary = d;
+    if (patch.briefing) |b| {
+        var cur = &settings.briefing;
+        if (b.enabled) |v| cur.enabled = v;
+        if (b.backend) |v| cur.backend = v;
+        if (b.model) |v| cur.model = v;
+        if (b.ollama_url) |v| cur.ollama_url = v;
+        if (b.min_words) |v| cur.min_words = v;
+        if (b.timeout_seconds) |v| cur.timeout_seconds = @max(v, 3);
+        if (b.listen) |v| cur.listen = v;
+        if (b.listen_seconds) |v| cur.listen_seconds = std.math.clamp(v, 2, 8);
+        if (b.recognizer) |v| cur.recognizer = v;
+        if (b.yes_words) |v| cur.yes_words = v;
+        if (b.no_words) |v| cur.no_words = v;
+    }
     if (patch.sources) |sp| {
         var it = sp.map.iterator();
         while (it.next()) |e| {
@@ -476,6 +558,7 @@ fn patchSettings(s: *Server, req: *Exchange, a: std.mem.Allocator) !void {
             if (e.value_ptr.enabled) |v| cur.enabled = v;
             if (e.value_ptr.voice) |v| cur.voice = v;
             if (e.value_ptr.announce) |v| cur.announce = v;
+            if (e.value_ptr.brief) |v| cur.brief = v;
             try settings.sources.map.put(a, e.key_ptr.*, cur);
         }
     }

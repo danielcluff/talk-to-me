@@ -55,6 +55,8 @@ pub const usage =
     \\  install TARGET       claude | codex | opencode | herdr
     \\  uninstall TARGET
     \\  integrations [--json] what is installed
+    \\  answer yes|no        answer "Want the full report?" after a briefing
+    \\  report               read the full report behind the last briefing
     \\  pair                 browser extensions waiting for approval, and paired ones
     \\  pair approve|deny ID
     \\  pair forget ORIGIN   unpair an extension
@@ -124,6 +126,12 @@ fn run(init: std.process.Init) !void {
     if (eql(cmd, "models")) return modelsCmd(&ctx, rest);
     if (eql(cmd, "config")) return configCmd(&ctx, rest);
     if (eql(cmd, "pair")) return pairCmd(&ctx, rest);
+    if (eql(cmd, "answer")) return answerCmd(&ctx, rest);
+    if (eql(cmd, "report")) {
+        try ensureServer(&ctx);
+        _ = try request(&ctx, .POST, "/v1/briefing/last", "{}");
+        return out(io, "reading the last full report\n");
+    }
     if (eql(cmd, "hook")) return integrations.hook(&ctx, rest);
     if (eql(cmd, "mcp")) return integrations.mcp(&ctx, rest);
     if (eql(cmd, "install")) return integrations.installCmd(&ctx, rest, true);
@@ -350,9 +358,10 @@ fn speak(ctx: *Ctx, args: []const []const u8) !void {
 
     try ensureServer(ctx);
     const body = try request(ctx, .POST, path, payload.written());
-    const R = struct { job_id: ?[]const u8 = null, chunks: usize = 0, position: usize = 0, dropped: ?[]const u8 = null };
+    const R = struct { job_id: ?[]const u8 = null, chunks: usize = 0, position: usize = 0, dropped: ?[]const u8 = null, summarizing: bool = false };
     const r = std.json.parseFromSliceLeaky(R, ctx.arena, body, .{ .ignore_unknown_fields = true }) catch R{};
     if (r.dropped) |reason| return outf(ctx, "not queued: {s}\n", .{reason});
+    if (r.summarizing) return out(ctx.io, "summarizing for a briefing\n");
     const id = r.job_id orelse return fail(ctx, "unexpected response: {s}", .{body});
     if (!wait) {
         if (r.position == 0)
@@ -557,4 +566,13 @@ fn pairCmd(ctx: *Ctx, rest: []const []const u8) !void {
         return outf(ctx, "unpaired {s}\n", .{rest[1]});
     }
     return fail(ctx, "usage: talktome pair [approve|deny ID | forget ORIGIN]", .{});
+}
+
+fn answerCmd(ctx: *Ctx, rest: []const []const u8) !void {
+    if (rest.len != 1 or !(eql(rest[0], "yes") or eql(rest[0], "no"))) return fail(ctx, "usage: talktome answer yes|no", .{});
+    try ensureServer(ctx);
+    const body = try std.json.Stringify.valueAlloc(ctx.arena, .{ .answer = rest[0] }, .{});
+    const res = rawRequest(ctx, .POST, "/v1/briefing/answer", body) catch return fail(ctx, "cannot reach the server", .{});
+    if (res.status == .conflict) return out(ctx.io, "no question is waiting\n");
+    return outf(ctx, "{s}\n", .{if (eql(rest[0], "yes")) "reading the full report" else "skipped"});
 }

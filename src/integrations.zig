@@ -17,6 +17,12 @@ const log = std.log.scoped(.integrations);
 
 pub fn hook(ctx: *Ctx, rest: []const []const u8) !void {
     if (rest.len == 0) return main.fail(ctx, "usage: talktome hook claude|codex|opencode", .{});
+    // a summarizer run by Talk to Me itself: its reply is not a report
+    if (ctx.environ.get("TALKTOME_SUPPRESS") != null) {
+        // Codex's chained notify program should still run
+        if (main.eql(rest[0], "codex")) chainOnly(ctx, rest[1..]);
+        return;
+    }
     const which = rest[0];
     const result = if (main.eql(which, "claude"))
         hookClaude(ctx)
@@ -45,6 +51,7 @@ fn speakReply(ctx: *Ctx, app: []const u8, cwd: []const u8, session: []const u8, 
     if (std.mem.trim(u8, text, " \t\r\n").len == 0) return;
     const label = if (cwd.len > 0) std.fs.path.basename(cwd) else "";
     const payload = try std.json.Stringify.valueAlloc(ctx.arena, .{
+        .kind = "reply",
         .text = text,
         .format = "markdown",
         .policy = "replace",
@@ -110,6 +117,22 @@ fn lastClaudeReply(ctx: *Ctx, path: []const u8) ![]const u8 {
         }
     }
     return turn.items;
+}
+
+/// Run only the chained notify program of a Codex hook call.
+fn chainOnly(ctx: *Ctx, args: []const []const u8) void {
+    if (args.len == 0) return;
+    const json = args[args.len - 1];
+    var i: usize = 0;
+    while (i < args.len - 1) : (i += 1) {
+        if (main.eql(args[i], "--chain") and i + 1 < args.len - 1) {
+            var argv: std.ArrayList([]const u8) = .empty;
+            argv.appendSlice(ctx.arena, args[i + 1 .. args.len - 1]) catch return;
+            argv.append(ctx.arena, json) catch return;
+            _ = std.process.spawn(ctx.io, .{ .argv = argv.items, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore }) catch {};
+            return;
+        }
+    }
 }
 
 /// Codex `notify`: argv ends with the JSON payload. `--chain PROG ARGS...`
@@ -275,6 +298,7 @@ fn callTool(ctx: *Ctx, app: []const u8, params: ?std.json.Value) ![]const u8 {
     if (main.eql(name, "speak")) {
         const text = argString(params, "text") orelse return "speak needs text";
         const payload = try std.json.Stringify.valueAlloc(ctx.arena, .{
+            .kind = "message",
             .text = text,
             .voice = argString(params, "voice"),
             .policy = if (argBool(params, "interrupt")) "interrupt" else "queue",

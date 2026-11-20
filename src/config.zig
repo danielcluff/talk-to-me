@@ -21,6 +21,27 @@ pub const SourceSettings = struct {
     voice: []const u8 = "",
     /// say who is speaking first, e.g. "Claude, in talk-to-me."
     announce: bool = false,
+    /// while briefings are on: summarize this source's replies (else read in full)
+    brief: bool = true,
+};
+
+/// Briefings: summarize agent replies, then offer the full report.
+pub const Briefing = struct {
+    enabled: bool = false,
+    backend: @import("briefing.zig").Backend = .codex,
+    /// model for the backend; empty = the tool's default
+    model: []const u8 = "",
+    ollama_url: []const u8 = "http://127.0.0.1:11434",
+    /// shorter replies are read in full
+    min_words: u32 = 60,
+    timeout_seconds: u32 = 30,
+    /// listen for "yes" / "no" after the question (the app does the listening)
+    listen: bool = true,
+    listen_seconds: u32 = 4,
+    /// "apple" or a local recognizer model id
+    recognizer: []const u8 = "apple",
+    yes_words: []const []const u8 = &.{ "yes", "yeah", "yep", "sure", "read it", "go ahead", "okay", "ok", "please" },
+    no_words: []const []const u8 = &.{ "no", "nope", "skip", "not now", "later", "no thanks" },
 };
 
 pub const Settings = struct {
@@ -40,6 +61,7 @@ pub const Settings = struct {
     paired_origins: []const []const u8 = &.{},
     /// pronunciation dictionary, applied before sentence splitting
     dictionary: []const DictionaryEntry = &.{},
+    briefing: Briefing = .{},
 };
 
 /// Spoken and displayed name of a source app.

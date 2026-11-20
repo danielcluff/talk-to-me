@@ -22,6 +22,7 @@ const models = @import("models/models.zig");
 const markdown = @import("text/markdown.zig");
 const chunker = @import("text/chunk.zig");
 const dictionary = @import("text/dictionary.zig");
+const briefing = @import("briefing.zig");
 
 const log = std.log.scoped(.core);
 
@@ -74,7 +75,16 @@ pub const Source = struct {
     session: []const u8 = "",
 };
 
+/// What a request is. Only `reply` (an agent's end-of-turn report, sent by
+/// the hooks) can become a briefing; everything else is read as asked.
+pub const Kind = enum { read, reply, message, briefing, report };
+
 pub const SpeakRequest = struct {
+    kind: Kind = .read,
+    /// skip the per-source "say its name first" intro
+    no_announce: bool = false,
+    /// brief even when briefings are off or the reply is short (Settings → Test)
+    force_brief: bool = false,
     text: ?[]const u8 = null,
     /// pre-split sentences (browser); used as-is instead of `text`
     chunks: ?[]const []const u8 = null,
@@ -87,6 +97,8 @@ pub const SpeakRequest = struct {
 
 pub const SpeakResult = union(enum) {
     queued: struct { id: u64, chunks: usize, position: usize },
+    /// handed to the summarizer; the briefing is queued when it's ready
+    summarizing: void,
     dropped: []const u8, // reason
 };
 
@@ -106,7 +118,36 @@ const Job = struct {
     preview: []const u8,
     hash: u64,
     created_ms: i64,
+    /// a briefing: when it finishes, hold the queue for "want the full report?"
+    ask: bool = false,
 };
+
+const BriefTask = struct {
+    arena: std.heap.ArenaAllocator,
+    text: []const u8,
+    source: Source,
+    voice: ?[]const u8,
+    speed: ?f32,
+    policy: Policy,
+};
+
+/// The full report behind the latest briefing (gpa-owned strings).
+const Report = struct {
+    briefing_job: u64,
+    app: []u8,
+    label: []u8,
+    session: []u8,
+    text: []u8,
+};
+
+/// The queue is held after a briefing until the answer or the deadline.
+const Hold = struct { job: u64, deadline_ms: i64 };
+
+fn monoMs() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
+}
 
 pub const Summary = struct {
     id: u64,
@@ -123,7 +164,7 @@ pub const Summary = struct {
     }
 };
 
-pub const EventKind = enum { job_queued, job_started, chunk_started, job_finished, player_state, model_state, pair_request };
+pub const EventKind = enum { job_queued, job_started, chunk_started, job_finished, player_state, model_state, pair_request, briefing, ask, answered };
 
 pub const Event = struct {
     seq: u64 = 0,
@@ -216,6 +257,13 @@ pub const Core = struct {
 
     engine_thread: ?std.Thread = null,
 
+    // briefings, guarded by mu
+    brief_tasks: std.ArrayList(*BriefTask) = .empty,
+    brief_cv: Cond = .{},
+    brief_thread: ?std.Thread = null,
+    hold: ?Hold = null,
+    last_report: ?Report = null,
+
     pub fn create(gpa: std.mem.Allocator, io: Io, paths: config.Paths, settings: config.Settings) !*Core {
         const self = try gpa.create(Core);
         self.* = .{
@@ -230,6 +278,7 @@ pub const Core = struct {
         self.settings = try dupeSettings(self.settings_arena.allocator(), settings);
         self.last_active_ms = self.nowMs();
         self.engine_thread = try std.Thread.spawn(.{}, engineMain, .{self});
+        self.brief_thread = try std.Thread.spawn(.{}, briefMain, .{self});
         return self;
     }
 
@@ -237,8 +286,16 @@ pub const Core = struct {
         self.mu.lock();
         self.shutting_down = true;
         self.work_cv.broadcast();
+        self.brief_cv.broadcast();
         self.mu.unlock();
         if (self.engine_thread) |t| t.join();
+        if (self.brief_thread) |t| t.join();
+        for (self.brief_tasks.items) |t| {
+            t.arena.deinit();
+            self.gpa.destroy(t);
+        }
+        self.brief_tasks.deinit(self.gpa);
+        if (self.last_report) |r| self.freeReport(r);
         if (self.download_thread) |t| t.join();
         self.player_mu.lock();
         if (self.player) |p| c.ta_player_free(p);
@@ -261,6 +318,12 @@ pub const Core = struct {
         return @intCast(@divTrunc(ns, std.time.ns_per_ms));
     }
 
+    fn dupeList(a: std.mem.Allocator, list: []const []const u8) ![]const []const u8 {
+        const out = try a.alloc([]const u8, list.len);
+        for (list, out) |x, *o| o.* = try a.dupe(u8, x);
+        return out;
+    }
+
     fn dupeSettings(a: std.mem.Allocator, s: config.Settings) !config.Settings {
         var out = s;
         out.model = try a.dupe(u8, s.model);
@@ -271,6 +334,11 @@ pub const Core = struct {
         const dict = try a.alloc(dictionary.Entry, s.dictionary.len);
         for (s.dictionary, dict) |e, *d| d.* = .{ .from = try a.dupe(u8, e.from), .to = try a.dupe(u8, e.to), .case_sensitive = e.case_sensitive };
         out.dictionary = dict;
+        out.briefing.model = try a.dupe(u8, s.briefing.model);
+        out.briefing.ollama_url = try a.dupe(u8, s.briefing.ollama_url);
+        out.briefing.recognizer = try a.dupe(u8, s.briefing.recognizer);
+        out.briefing.yes_words = try dupeList(a, s.briefing.yes_words);
+        out.briefing.no_words = try dupeList(a, s.briefing.no_words);
         out.sources = .{};
         var it = s.sources.map.iterator();
         while (it.next()) |e| {
@@ -453,8 +521,18 @@ pub const Core = struct {
     fn advanceJob(self: *Core, reason: FinishReason) void {
         if (self.current) |j| {
             self.current = null;
+            const ask = j.ask and reason == .done;
             self.retire(j, reason);
+            if (ask) {
+                // "Want the full report?": hold the queue for the answer
+                const secs = @max(self.settings.briefing.listen_seconds, 1);
+                self.hold = .{ .job = j.id, .deadline_ms = monoMs() + @as(i64, secs) * 1000 + 500 };
+                self.pushEvent(.{ .kind = .ask, .job = j.id, .index = secs });
+                self.work_cv.signal();
+                return;
+            }
         }
+        if (self.hold != null) return;
         if (self.pending.items.len > 0) {
             const next = self.pending.orderedRemove(0);
             self.startJob(next);
@@ -482,6 +560,14 @@ pub const Core = struct {
             defer self.mu.unlock();
             break :blk try dupeSettings(a, self.settings);
         };
+
+        if (req.kind == .reply or req.force_brief) {
+            if (try self.maybeBrief(req, s)) {
+                j.arena.deinit();
+                self.gpa.destroy(j);
+                return .summarizing;
+            }
+        }
 
         // text → blocks → chunks (outside the lock)
         if (req.chunks) |pre| {
@@ -517,7 +603,7 @@ pub const Core = struct {
             self.gpa.destroy(j);
             return .{ .dropped = "muted" };
         };
-        if (src) |ss| if (ss.announce) {
+        if (src) |ss| if (ss.announce and !req.no_announce) {
             const who = config.sourceName(req.source.app);
             const intro = if (req.source.label.len > 0)
                 try std.fmt.allocPrint(a, "{s}, in {s}.", .{ who, req.source.label })
@@ -538,9 +624,10 @@ pub const Core = struct {
         };
         j.voice = try a.dupe(u8, req.voice orelse source_voice orelse "");
         j.speed = req.speed orelse s.speed;
-        const first = j.chunks[if (j.chunks.len > 1 and src != null and src.?.announce) 1 else 0].text;
+        const first = j.chunks[if (j.chunks.len > 1 and src != null and src.?.announce and !req.no_announce) 1 else 0].text;
         j.preview = first[0..@min(first.len, 119)];
         j.hash = hashText(j.source.app, j.chunks);
+        j.ask = req.kind == .briefing;
         j.created_ms = self.nowMs();
 
         self.mu.lock();
@@ -781,6 +868,14 @@ pub const Core = struct {
             self.graveyard.clearRetainingCapacity();
             _ = scratch.reset(.retain_capacity);
 
+            if (self.hold) |h| if (monoMs() >= h.deadline_ms) {
+                self.endHold("timeout");
+                self.mu.unlock();
+                self.ensurePlaying();
+                self.mu.lock();
+                continue;
+            };
+
             const wanted = self.settings.model;
             const busy = self.current != null or self.pending.items.len > 0;
             const model_mismatch = self.load_state == .loaded and !std.mem.eql(u8, self.engine_model, wanted);
@@ -832,7 +927,8 @@ pub const Core = struct {
                 self.unloadModel();
                 continue;
             }
-            self.work_cv.timedWait(&self.mu, 1000);
+            const wait_ms: u64 = if (self.hold) |h| @intCast(std.math.clamp(h.deadline_ms - monoMs(), 10, 1000)) else 1000;
+            self.work_cv.timedWait(&self.mu, wait_ms);
         }
         self.mu.unlock();
     }
@@ -1033,6 +1129,208 @@ pub const Core = struct {
         self.download_progress.active.store(false, .release);
         self.resetLoadFailure();
         log.info("download of {s} finished", .{m.id});
+    }
+
+    // ------------------------------------------------------------ briefings
+
+    fn wordCount(text: []const u8) usize {
+        var n: usize = 0;
+        var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
+        while (it.next()) |_| n += 1;
+        return n;
+    }
+
+    /// Hand an agent reply to the summarizer if briefings apply to it.
+    fn maybeBrief(self: *Core, req: SpeakRequest, s: config.Settings) !bool {
+        if (!s.briefing.enabled and !req.force_brief) return false;
+        const src = s.sources.map.get(req.source.app);
+        if (src) |ss| if (!ss.enabled or !ss.brief) return false;
+        const text = req.text orelse (if (req.chunks) |pre| try std.mem.join(self.gpa, " ", pre) else return false);
+        defer if (req.text == null) self.gpa.free(text);
+        if (!req.force_brief and wordCount(text) < s.briefing.min_words) return false;
+
+        const t = try self.gpa.create(BriefTask);
+        t.arena = .init(self.gpa);
+        const a = t.arena.allocator();
+        t.text = try a.dupe(u8, text);
+        t.source = .{ .app = try a.dupe(u8, req.source.app), .label = try a.dupe(u8, req.source.label), .session = try a.dupe(u8, req.source.session) };
+        t.voice = if (req.voice) |v| try a.dupe(u8, v) else null;
+        t.speed = req.speed;
+        t.policy = if (req.policy == .interrupt) .interrupt else if (req.policy == .replace) .replace else .queue;
+
+        self.mu.lock();
+        defer self.mu.unlock();
+        try self.brief_tasks.append(self.gpa, t);
+        self.pushEvent((Event{ .kind = .briefing }).withState("summarizing"));
+        self.brief_cv.signal();
+        return true;
+    }
+
+    fn freeReport(self: *Core, r: Report) void {
+        self.gpa.free(r.app);
+        self.gpa.free(r.label);
+        self.gpa.free(r.session);
+        self.gpa.free(r.text);
+    }
+
+    fn briefMain(self: *Core) void {
+        self.mu.lock();
+        while (!self.shutting_down) {
+            if (self.brief_tasks.items.len == 0) {
+                self.brief_cv.wait(&self.mu);
+                continue;
+            }
+            const t = self.brief_tasks.orderedRemove(0);
+            const cfg: briefing.Config = .{
+                .backend = self.settings.briefing.backend,
+                .model = t.arena.allocator().dupe(u8, self.settings.briefing.model) catch "",
+                .ollama_url = t.arena.allocator().dupe(u8, self.settings.briefing.ollama_url) catch "",
+                .timeout_seconds = self.settings.briefing.timeout_seconds,
+            };
+            self.mu.unlock();
+            self.brief(t, cfg);
+            t.arena.deinit();
+            self.gpa.destroy(t);
+            self.mu.lock();
+        }
+        self.mu.unlock();
+    }
+
+    fn brief(self: *Core, t: *BriefTask, cfg: briefing.Config) void {
+        const a = t.arena.allocator();
+        const home: []const u8 = if (std.c.getenv("HOME")) |h| std.mem.span(h) else "/tmp";
+        const env: briefing.Env = .{
+            .home = home,
+            .workdir = std.fs.path.join(a, &.{ self.paths.root, "briefing" }) catch "/tmp",
+        };
+        const started = monoMs();
+        var ok = true;
+        const summary = briefing.summarize(a, self.io, env, cfg, t.text) catch |err| blk: {
+            log.warn("briefing with {t} failed ({t}); reading the first paragraph instead", .{ cfg.backend, err });
+            ok = false;
+            break :blk briefing.firstParagraph(t.text);
+        };
+        log.info("briefing ready in {d} ms ({t})", .{ monoMs() - started, cfg.backend });
+        const who = config.sourceName(t.source.app);
+        const spoken = (if (t.source.label.len > 0)
+            std.fmt.allocPrint(a, "{s}, in {s}. {s} Want the full report?", .{ who, t.source.label, summary })
+        else
+            std.fmt.allocPrint(a, "{s}. {s} Want the full report?", .{ who, summary })) catch return;
+
+        const result = self.speak(.{
+            .kind = .briefing,
+            .no_announce = true,
+            .text = spoken,
+            .format = .text,
+            .source = t.source,
+            .voice = t.voice,
+            .speed = t.speed,
+            .policy = t.policy,
+        }) catch |err| {
+            log.err("could not queue the briefing: {t}", .{err});
+            return;
+        };
+        const id = switch (result) {
+            .queued => |q| q.id,
+            else => return,
+        };
+        const report: Report = .{
+            .briefing_job = id,
+            .app = self.gpa.dupe(u8, t.source.app) catch return,
+            .label = self.gpa.dupe(u8, t.source.label) catch return,
+            .session = self.gpa.dupe(u8, t.source.session) catch return,
+            .text = self.gpa.dupe(u8, t.text) catch return,
+        };
+        self.mu.lock();
+        if (self.last_report) |old| self.freeReport(old);
+        self.last_report = report;
+        self.pushEvent((Event{ .kind = .briefing }).withState(if (ok) "ready" else "fallback"));
+        self.mu.unlock();
+    }
+
+    /// Release the held queue (caller holds mu).
+    fn endHold(self: *Core, how: []const u8) void {
+        const h = self.hold orelse return;
+        self.hold = null;
+        self.pushEvent((Event{ .kind = .answered, .job = h.job }).withState(how));
+        if (self.current == null and self.pending.items.len > 0) {
+            self.startJob(self.pending.orderedRemove(0));
+        }
+        self.work_cv.signal();
+    }
+
+    pub const AnswerResult = enum { reading, skipped, no_question };
+
+    /// The answer to "Want the full report?" (from listening, the hotkey or the CLI).
+    pub fn answer(self: *Core, yes: bool) !AnswerResult {
+        var report: ?Report = null;
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            const h = self.hold orelse return .no_question;
+            if (yes) if (self.last_report) |r| if (r.briefing_job == h.job) {
+                report = .{
+                    .briefing_job = r.briefing_job,
+                    .app = try self.gpa.dupe(u8, r.app),
+                    .label = try self.gpa.dupe(u8, r.label),
+                    .session = try self.gpa.dupe(u8, r.session),
+                    .text = try self.gpa.dupe(u8, r.text),
+                };
+            };
+            if (report == null) {
+                self.endHold("no");
+            } else {
+                self.hold = null;
+                self.pushEvent((Event{ .kind = .answered, .job = h.job }).withState("yes"));
+            }
+        }
+        const r = report orelse {
+            self.ensurePlaying();
+            return .skipped;
+        };
+        defer self.freeReport(r);
+        _ = try self.speak(.{
+            .kind = .report,
+            .no_announce = true,
+            .text = r.text,
+            .source = .{ .app = r.app, .label = r.label, .session = r.session },
+            .policy = .interrupt,
+        });
+        return .reading;
+    }
+
+    /// Read the full report behind the latest briefing again.
+    pub fn readLastReport(self: *Core) !bool {
+        var copy: ?Report = null;
+        {
+            self.mu.lock();
+            defer self.mu.unlock();
+            const r = self.last_report orelse return false;
+            copy = .{
+                .briefing_job = r.briefing_job,
+                .app = try self.gpa.dupe(u8, r.app),
+                .label = try self.gpa.dupe(u8, r.label),
+                .session = try self.gpa.dupe(u8, r.session),
+                .text = try self.gpa.dupe(u8, r.text),
+            };
+            if (self.hold != null) self.endHold("yes");
+        }
+        const r = copy.?;
+        defer self.freeReport(r);
+        _ = try self.speak(.{
+            .kind = .report,
+            .no_announce = true,
+            .text = r.text,
+            .source = .{ .app = r.app, .label = r.label, .session = r.session },
+            .policy = .interrupt,
+        });
+        return true;
+    }
+
+    pub fn awaitingAnswer(self: *Core) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.hold != null;
     }
 
     // ------------------------------------------------------------ snapshots

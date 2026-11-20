@@ -842,17 +842,24 @@ plus the context cache. A report of up to 4k tokens needs about 0.45 to
   the idle timeout.
 - With Codex, Claude Code, OpenCode on a cloud model, or Ollama, it adds
   nothing to Talk to Me's memory. Ollama holds its own.
+- All five are supported, for people with the memory to spare. A cloud CLI
+  such as Codex Luna is the lighter choice on a busy machine.
 
-*Listening for yes or no*
-- **Apple on-device speech (default).** `SFSpeechRecognizer` with
-  `requiresOnDeviceRecognition`. It works on Sequoia, needs no download and
-  adds no memory to speak of. It needs Speech Recognition and Microphone
-  permission (on the Permissions page).
-- **Qwen3-ASR 0.6B (optional, fully in our engine).** Q8_0 805 MB plus
-  mmproj 214 MB, about 1.1 GB while loaded, through libmtmd
-  (`common_chat_get_asr_prompt`, with a hotwords hint: "yes, no, read it,
-  skip, sure"). It's offered on Models if Apple's recognizer proves
-  unreliable for short answers.
+*Listening for yes or no.* Several recognizers are supported; the default
+is the one that costs almost nothing.
+
+| Recognizer | Download | Memory while listening | Notes |
+|---|---|---|---|
+| **Apple on-device (default)** | none | negligible | `SFSpeechRecognizer` with `requiresOnDeviceRecognition`. Works on Sequoia. |
+| Qwen3-ASR 0.6B Q8_0 | 805 + 214 MB | ~1.1 GB | in-process through libmtmd, hotwords hint |
+| Qwen3-ASR 1.7B Q8_0 | 2,165 + 356 MB | ~2.6 GB | more accurate |
+| Voxtral Mini 3B Q4_K_M | 2,473 + 716 MB | ~3.3 GB | largest; strong in noisy rooms |
+
+- The local recognizers use `common_chat_get_asr_prompt` with a hotwords hint
+  ("yes, no, read it, skip, sure"), load when the answer window opens, and
+  unload after the idle timeout.
+- Apple's recognizer needs Speech Recognition and Microphone permission; the
+  local ones need only Microphone. Both are on the Permissions page.
 - **The microphone opens only for the answer window,** after playback of the
   question ends, so the app never hears its own voice. The menu bar icon
   shows a listening state.
@@ -864,6 +871,17 @@ plus the context cache. A report of up to 4k tokens needs about 0.45 to
 *Peak memory, everything local:* Kokoro 0.43 GB, Qwen3 1.7B 1.8 GB and
 Qwen3-ASR 1.1 GB come to about 3.3 GB. With Codex as the summarizer and
 Apple speech: about 0.45 GB, the same as today.
+
+*Every download is visible and deletable.* This applies to all model kinds
+(voices, summarizers, recognizers), and the Models page shows it now:
+- Each installed model shows its folder
+  (`~/Library/Application Support/TalkToMe/models/<id>/`), the files in it
+  and their size on disk, with "Show in Finder" and "Delete…".
+- A footer shows the total disk used by models.
+- Models are grouped by kind (Voices, Summaries, Listening) and marked "In
+  use" when they're the active one, so unused downloads are easy to spot.
+- Deleting the model in use asks first and switches to the default (or off).
+- Partial downloads (`*.part`) count too, with a "Remove" next to them.
 
 *Settings*
 - A **Briefing** page: on/off (default off), an explanation and setup steps,
@@ -882,8 +900,8 @@ Apple speech: about 0.45 GB, the same as today.
 - The summary arrives within about 3 s of the agent finishing, with the
   local 1.7B model or Codex Luna.
 
-*Open question:* should a briefing also offer actions beyond reading, such
-as "open that tab in herdr"?
+*Later (not planned yet):* actions beyond reading from a briefing, such as
+"open that tab in herdr" or "reply to Codex".
 
 ---
 

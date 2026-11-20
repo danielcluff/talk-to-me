@@ -30,6 +30,8 @@ pub const Model = struct {
     default_voice: []const u8,
     /// English voice filter (name prefixes); empty = all voices
     voice_prefixes: []const []const u8 = &.{},
+    /// English voice filter (substrings, e.g. "_en-"); empty = no filter
+    voice_contains: []const []const u8 = &.{},
     supports_speed: bool = true,
 
     pub fn totalSize(m: Model) u64 {
@@ -37,9 +39,12 @@ pub const Model = struct {
     }
 
     pub fn isEnglishVoice(m: Model, voice: []const u8) bool {
-        if (m.voice_prefixes.len == 0) return true;
+        if (m.voice_prefixes.len == 0 and m.voice_contains.len == 0) return true;
         for (m.voice_prefixes) |p| {
             if (std.mem.startsWith(u8, voice, p)) return true;
+        }
+        for (m.voice_contains) |c| {
+            if (std.mem.indexOf(u8, voice, c) != null) return true;
         }
         return false;
     }

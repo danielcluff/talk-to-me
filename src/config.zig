@@ -9,6 +9,7 @@
 const std = @import("std");
 const Io = std.Io;
 const markdown = @import("text/markdown.zig");
+pub const DictionaryEntry = @import("text/dictionary.zig").Entry;
 
 pub const default_port: u16 = 9932;
 
@@ -37,6 +38,8 @@ pub const Settings = struct {
     /// browser extensions allowed to call the API (Origin header values),
     /// added by approving a pairing request
     paired_origins: []const []const u8 = &.{},
+    /// pronunciation dictionary, applied before sentence splitting
+    dictionary: []const DictionaryEntry = &.{},
 };
 
 /// Spoken and displayed name of a source app.

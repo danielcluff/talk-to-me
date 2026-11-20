@@ -21,6 +21,7 @@ const config = @import("config.zig");
 const models = @import("models/models.zig");
 const markdown = @import("text/markdown.zig");
 const chunker = @import("text/chunk.zig");
+const dictionary = @import("text/dictionary.zig");
 
 const log = std.log.scoped(.core);
 
@@ -114,6 +115,8 @@ pub const Summary = struct {
     preview: [120]u8 = @splat(0),
     chunks: u32,
     state: JobState,
+    /// wall-clock milliseconds when it finished
+    finished_ms: i64 = 0,
 
     fn str(buf: []const u8) []const u8 {
         return std.mem.sliceTo(buf, 0);
@@ -145,7 +148,11 @@ pub const Event = struct {
 const ModelLoad = enum { unloaded, loading, loaded, failed };
 
 const event_ring = 512;
-const history_len = 32;
+const history_len = 50;
+
+/// Full text of a history entry, filled in by the engine thread when it frees
+/// the job (the audio thread, which often finishes jobs, never allocates).
+const HistoryText = struct { id: u64, text: []u8 };
 
 // ------------------------------------------------------------------ core
 
@@ -175,6 +182,7 @@ pub const Core = struct {
     paused: bool = false,
     graveyard: std.ArrayList(*Job) = .empty,
     history: [history_len]Summary = undefined,
+    history_text: [history_len]?HistoryText = @splat(null),
     history_count: usize = 0,
     history_head: usize = 0,
 
@@ -241,6 +249,7 @@ pub const Core = struct {
         for (self.graveyard.items) |j| self.freeJob(j);
         self.pending.deinit(self.gpa);
         self.graveyard.deinit(self.gpa);
+        for (self.history_text) |maybe| if (maybe) |h| self.gpa.free(h.text);
         self.voices_arena.deinit();
         self.settings_arena.deinit();
         self.catalog.deinit();
@@ -259,6 +268,9 @@ pub const Core = struct {
         const origins = try a.alloc([]const u8, s.paired_origins.len);
         for (s.paired_origins, origins) |o, *d| d.* = try a.dupe(u8, o);
         out.paired_origins = origins;
+        const dict = try a.alloc(dictionary.Entry, s.dictionary.len);
+        for (s.dictionary, dict) |e, *d| d.* = .{ .from = try a.dupe(u8, e.from), .to = try a.dupe(u8, e.to), .case_sensitive = e.case_sensitive };
+        out.dictionary = dict;
         out.sources = .{};
         var it = s.sources.map.iterator();
         while (it.next()) |e| {
@@ -340,7 +352,38 @@ pub const Core = struct {
 
     // ------------------------------------------------------------ jobs
 
+    /// The job's text: its chunks, with blank lines where blocks end.
+    fn jobText(gpa: std.mem.Allocator, j: *const Job) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(gpa);
+        for (j.chunks, 0..) |ch, i| {
+            if (i > 0) try out.appendSlice(gpa, if (j.chunks[i - 1].pause_after_ms > 0) "\n\n" else " ");
+            try out.appendSlice(gpa, ch.text);
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// Engine thread, with mu held: keep the text of a job that is in history.
+    fn keepHistoryText(self: *Core, j: *const Job) void {
+        var k: usize = 0;
+        while (k < self.history_count) : (k += 1) {
+            if (self.history[k].id != j.id) continue;
+            const text = jobText(self.gpa, j) catch return;
+            if (self.history_text[k]) |old| self.gpa.free(old.text);
+            self.history_text[k] = .{ .id = j.id, .text = text };
+            return;
+        }
+    }
+
+    fn historyTextFor(self: *Core, id: u64) ?[]const u8 {
+        for (self.history_text) |maybe| if (maybe) |h| {
+            if (h.id == id) return h.text;
+        };
+        return null;
+    }
+
     fn freeJob(self: *Core, j: *Job) void {
+        self.keepHistoryText(j);
         for (j.audio) |maybe| if (maybe) |pcm| {
             if (pcm.len > 0) self.gpa.free(pcm);
         };
@@ -363,7 +406,10 @@ pub const Core = struct {
     }
 
     fn recordHistory(self: *Core, j: *const Job, state: JobState) void {
-        self.history[self.history_head] = summarize(j, state);
+        var sum = summarize(j, state);
+        var now: std.c.timespec = undefined;
+        if (std.c.clock_gettime(.REALTIME, &now) == 0) sum.finished_ms = @as(i64, now.sec) * 1000 + @divTrunc(@as(i64, now.nsec), std.time.ns_per_ms);
+        self.history[self.history_head] = sum;
         self.history_head = (self.history_head + 1) % history_len;
         if (self.history_count < history_len) self.history_count += 1;
     }
@@ -429,10 +475,12 @@ pub const Core = struct {
         errdefer j.arena.deinit();
         const a = j.arena.allocator();
 
+        // a deep copy: settings strings and lists live in an arena that a
+        // settings change frees while this request is still running
         const s = blk: {
             self.mu.lock();
             defer self.mu.unlock();
-            break :blk self.settings;
+            break :blk try dupeSettings(a, self.settings);
         };
 
         // text → blocks → chunks (outside the lock)
@@ -440,7 +488,7 @@ pub const Core = struct {
             var list: std.ArrayList(chunker.Chunk) = .empty;
             for (pre) |t| {
                 const trimmed = std.mem.trim(u8, t, " \t\r\n");
-                if (trimmed.len > 0) try list.append(a, .{ .text = try a.dupe(u8, trimmed) });
+                if (trimmed.len > 0) try list.append(a, .{ .text = try a.dupe(u8, try dictionary.apply(a, trimmed, s.dictionary)) });
             }
             j.chunks = list.items;
         } else {
@@ -450,7 +498,9 @@ pub const Core = struct {
                 .text => try markdown.plainToBlocks(self.gpa, text),
             };
             defer blocks.deinit();
-            const raw = try chunker.chunk(self.gpa, blocks.items, .{});
+            const spoken = try a.alloc([]const u8, blocks.items.len);
+            for (blocks.items, spoken) |b, *o| o.* = try dictionary.apply(a, b, s.dictionary);
+            const raw = try chunker.chunk(self.gpa, spoken, .{});
             defer self.gpa.free(raw);
             j.chunks = try a.alloc(chunker.Chunk, raw.len);
             for (raw, j.chunks) |src, *dst| dst.* = .{ .text = try a.dupe(u8, src.text), .pause_after_ms = src.pause_after_ms };
@@ -705,7 +755,8 @@ pub const Core = struct {
             .index = i,
             .text = try a.dupeSentinel(u8, j.chunks[i].text, 0),
             .voice = try a.dupeSentinel(u8, voice, 0),
-            .speed = j.speed,
+            // models without speed control reject anything but 1.0
+            .speed = if (self.catalog.find(self.engine_model)) |m| (if (m.supports_speed) j.speed else 1.0) else j.speed,
         };
     }
 
@@ -1025,6 +1076,8 @@ pub const Core = struct {
         chunks: usize,
         state: JobState,
         index: ?usize = null,
+        finished_ms: ?i64 = null,
+        has_text: bool = true,
     };
 
     /// Current, pending, then recent history (newest first).
@@ -1045,6 +1098,8 @@ pub const Core = struct {
                 .preview = try a.dupe(u8, Summary.str(&s.preview)),
                 .chunks = s.chunks,
                 .state = s.state,
+                .finished_ms = s.finished_ms,
+                .has_text = self.historyTextFor(s.id) != null,
             });
         }
         return out.items;
@@ -1060,6 +1115,23 @@ pub const Core = struct {
             .state = state,
             .index = index,
         };
+    }
+
+    pub const JobDetail = struct { view: JobView, text: []const u8 };
+
+    /// One job (current, queued or in history) with its full text.
+    pub fn jobDetail(self: *Core, a: std.mem.Allocator, id: u64) !?JobDetail {
+        const views = try self.jobViews(a);
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (views) |v| {
+            if (v.id != id) continue;
+            if (self.current) |j| if (j.id == id) return .{ .view = v, .text = try jobText(a, j) };
+            for (self.pending.items) |j| if (j.id == id) return .{ .view = v, .text = try jobText(a, j) };
+            const text = self.historyTextFor(id) orelse return .{ .view = v, .text = "" };
+            return .{ .view = v, .text = try a.dupe(u8, text) };
+        }
+        return null;
     }
 
     pub const ModelView = struct {
@@ -1103,6 +1175,25 @@ pub const Core = struct {
         return out.items;
     }
 
+    /// Accent and gender from a voice name: Kokoro "af_heart" (a/b = US/UK,
+    /// f/m), ZONOS3 "Savannah_en-American_F_1", tiny-voca "F2".
+    fn voiceTags(v: []const u8) struct { accent: []const u8, gender: []const u8 } {
+        if (std.mem.indexOf(u8, v, "_en-")) |i| {
+            const rest = v[i + 4 ..];
+            const accent: []const u8 = if (std.mem.startsWith(u8, rest, "American")) "US" else if (std.mem.startsWith(u8, rest, "British")) "UK" else "";
+            const gender: []const u8 = if (std.mem.indexOf(u8, rest, "_F_") != null) "female" else if (std.mem.indexOf(u8, rest, "_M_") != null) "male" else "";
+            return .{ .accent = accent, .gender = gender };
+        }
+        if (v.len > 2 and v[2] == '_') {
+            const accent: []const u8 = if (v[0] == 'a') "US" else if (v[0] == 'b') "UK" else "";
+            const gender: []const u8 = if (v[1] == 'f') "female" else if (v[1] == 'm') "male" else "";
+            return .{ .accent = accent, .gender = gender };
+        }
+        if (v.len > 0 and v[0] == 'F') return .{ .accent = "", .gender = "female" };
+        if (v.len > 0 and v[0] == 'M') return .{ .accent = "", .gender = "male" };
+        return .{ .accent = "", .gender = "" };
+    }
+
     pub const VoiceView = struct { name: []const u8, accent: []const u8, gender: []const u8, default: bool };
 
     /// English voices of the loaded active model. Call requireModel() first.
@@ -1114,10 +1205,11 @@ pub const Core = struct {
         const def = self.resolveVoice();
         for (self.voices.items) |v| {
             if (!m.isEnglishVoice(v)) continue;
+            const tags = voiceTags(v);
             try out.append(a, .{
                 .name = try a.dupe(u8, v),
-                .accent = if (v.len > 1 and v[0] == 'a') "US" else if (v.len > 1 and v[0] == 'b') "UK" else "",
-                .gender = if (v.len > 1 and v[1] == 'f') "female" else if (v.len > 1 and v[1] == 'm') "male" else if (v.len > 0 and v[0] == 'F') "female" else if (v.len > 0 and v[0] == 'M') "male" else "",
+                .accent = tags.accent,
+                .gender = tags.gender,
                 .default = std.mem.eql(u8, v, def),
             });
         }

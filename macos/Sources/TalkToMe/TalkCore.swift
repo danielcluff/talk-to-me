@@ -44,10 +44,12 @@ struct VoiceInfo: Decodable, Identifiable, Equatable {
     var `default`: Bool
     var id: String { name }
 
-    /// "af_heart" → "Heart", "M2" → "M2"
+    /// "af_heart" → "Heart", "Savannah_en-American_F_1" → "Savannah", "M2" → "M2"
     var displayName: String {
-        guard let us = name.firstIndex(of: "_") else { return name }
-        return name[name.index(after: us)...].capitalized
+        let parts = name.split(separator: "_")
+        guard parts.count > 1 else { return name }
+        if parts[0].count == 2 { return parts[1].capitalized } // Kokoro: af_heart
+        return String(parts[0]) // ZONOS3: Savannah_en-American_F_1
     }
 }
 
@@ -59,6 +61,10 @@ struct JobInfo: Decodable, Identifiable, Equatable {
     var chunks: Int
     var state: String
     var index: Int?
+    var finished_ms: Double?
+    var has_text: Bool?
+
+    var finishedAt: Date? { finished_ms.map { Date(timeIntervalSince1970: $0 / 1000) } }
 }
 
 struct Settings: Codable, Equatable {
@@ -71,6 +77,7 @@ struct Settings: Codable, Equatable {
     var tables: String = "announce"
     var dedupe_seconds: Int = 30
     var sources: [String: SourceSetting] = [:]
+    var dictionary: [DictionaryEntry] = []
 
     init() {}
 
@@ -85,7 +92,14 @@ struct Settings: Codable, Equatable {
         tables = try c.decodeIfPresent(String.self, forKey: .tables) ?? "announce"
         dedupe_seconds = try c.decodeIfPresent(Int.self, forKey: .dedupe_seconds) ?? 30
         sources = try c.decodeIfPresent([String: SourceSetting].self, forKey: .sources) ?? [:]
+        dictionary = try c.decodeIfPresent([DictionaryEntry].self, forKey: .dictionary) ?? []
     }
+}
+
+struct DictionaryEntry: Codable, Equatable, Hashable {
+    var from: String
+    var to: String
+    var case_sensitive: Bool = false
 }
 
 struct SourceSetting: Codable, Equatable {
@@ -366,6 +380,23 @@ final class TalkCore: ObservableObject {
 
     func updateSource(_ app: String, _ patch: [String: Any]) {
         update(["sources": [app: patch]])
+    }
+
+    func replay(_ id: Int) { Task { await send("POST", "/v1/jobs/\(id)/replay") } }
+
+    func copyText(_ id: Int) {
+        struct Detail: Decodable { var text: String }
+        Task {
+            if let d = await get("/v1/jobs/\(id)", as: Detail.self) {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(d.text, forType: .string)
+            }
+        }
+    }
+
+    func setDictionary(_ entries: [DictionaryEntry]) {
+        let list = entries.map { ["from": $0.from, "to": $0.to, "case_sensitive": $0.case_sensitive] as [String: Any] }
+        update(["dictionary": list])
     }
 
     func previewVoice(_ v: VoiceInfo) {

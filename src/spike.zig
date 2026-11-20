@@ -113,6 +113,8 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
 
     var model_dir: ?[]const u8 = null;
+    var model_arg: ?[]const u8 = null;
+    var mmproj_arg: ?[]const u8 = null;
     var voice: ?[:0]const u8 = null;
     var speed: f32 = 1.0;
     var runs: usize = 3;
@@ -124,7 +126,11 @@ pub fn main(init: std.process.Init) !void {
     var it = std.process.Args.Iterator.init(init.minimal.args);
     _ = it.skip();
     while (it.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--model-dir")) {
+        if (std.mem.eql(u8, arg, "--model")) {
+            model_arg = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--mmproj")) {
+            mmproj_arg = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--model-dir")) {
             model_dir = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--voice")) {
             voice = it.next() orelse return error.MissingValue;
@@ -148,8 +154,8 @@ pub fn main(init: std.process.Init) !void {
         const home = init.environ_map.get("HOME") orelse return error.NoHome;
         break :blk try std.fs.path.join(arena, &.{ home, default_model_dir });
     };
-    const model_path = try std.fs.path.joinZ(arena, &.{ dir, model_file });
-    const mmproj_path = try std.fs.path.joinZ(arena, &.{ dir, mmproj_file });
+    const model_path = if (model_arg) |m| try arena.dupeSentinel(u8, m, 0) else try std.fs.path.joinZ(arena, &.{ dir, model_file });
+    const mmproj_path = if (mmproj_arg) |m| try arena.dupeSentinel(u8, m, 0) else try std.fs.path.joinZ(arena, &.{ dir, mmproj_file });
 
     c.te_set_log_level(if (verbose) 2 else 0);
 

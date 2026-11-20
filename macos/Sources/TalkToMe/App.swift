@@ -151,6 +151,10 @@ func appName(_ app: String) -> String {
     case "menu", "clipboard": return "Clipboard"
     case "selection": return "Selection"
     case "service": return "Services"
+    case "history": return "History"
+    case "browser": return "Browser"
+    case "herdr": return "herdr"
+    case "mcp": return "Agent"
     case "preview": return "Preview"
     default: return app
     }

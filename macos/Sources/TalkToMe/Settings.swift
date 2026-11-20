@@ -4,7 +4,7 @@ import ServiceManagement
 import SwiftUI
 
 enum SettingsPage: String, CaseIterable, Identifiable {
-    case general, models, voices, sources, shortcuts, permissions, about
+    case general, models, voices, sources, dictionary, history, shortcuts, permissions, about
     var id: String { rawValue }
 
     var title: String {
@@ -13,6 +13,8 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .models: "Models"
         case .voices: "Voices"
         case .sources: "Sources"
+        case .dictionary: "Dictionary"
+        case .history: "History"
         case .shortcuts: "Shortcuts"
         case .permissions: "Permissions"
         case .about: "About"
@@ -25,6 +27,8 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .models: "cpu"
         case .voices: "person.wave.2"
         case .sources: "app.connected.to.app.below.fill"
+        case .dictionary: "character.book.closed"
+        case .history: "clock.arrow.circlepath"
         case .shortcuts: "keyboard"
         case .permissions: "lock.shield"
         case .about: "info.circle"
@@ -89,6 +93,8 @@ struct SettingsView: View {
                     case .models: ModelsPage()
                     case .voices: VoicesPage()
                     case .sources: SourcesPage()
+                    case .dictionary: DictionaryPage()
+                    case .history: HistoryPage()
                     case .shortcuts: ShortcutsPage()
                     case .permissions: PermissionsPage()
                     case .about: AboutPage()
@@ -485,6 +491,130 @@ struct SourcesPage: View {
             }
             .disabled(!src.enabled)
         }
+    }
+}
+
+// MARK: - Dictionary
+
+struct DictionaryPage: View {
+    @EnvironmentObject var core: TalkCore
+    @State private var from = ""
+    @State private var to = ""
+    @State private var caseSensitive = false
+
+    var body: some View {
+        PageHeader(title: "Dictionary", subtitle: "Teach the voice how to say names, acronyms and jargon. Whole words only; code blocks aren't affected.")
+        Card {
+            HStack {
+                TextField("Written as (kubectl)", text: $from)
+                Image(systemName: "arrow.right").foregroundStyle(.secondary)
+                TextField("Say it as (cube control)", text: $to)
+                Toggle("Aa", isOn: $caseSensitive)
+                    .toggleStyle(.button)
+                    .help("Match upper and lower case exactly")
+                Button("Add") { add() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(from.trimmingCharacters(in: .whitespaces).isEmpty || to.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+            .onSubmit { add() }
+        }
+        if core.settings.dictionary.isEmpty {
+            Text("No entries yet.").foregroundStyle(.secondary)
+        } else {
+            Card {
+                ForEach(Array(core.settings.dictionary.enumerated()), id: \.offset) { i, e in
+                    if i > 0 { Divider() }
+                    HStack {
+                        Text(e.from).font(.body.monospaced())
+                        Image(systemName: "arrow.right").foregroundStyle(.secondary)
+                        Text(e.to)
+                        if e.case_sensitive { Badge(text: "Aa", color: .secondary) }
+                        Spacer()
+                        Button { core.speak("\(e.from).", app: "preview") } label: { Image(systemName: "play.circle") }
+                            .buttonStyle(.plain)
+                            .help("Hear it")
+                        Button { remove(i) } label: { Image(systemName: "trash") }
+                            .buttonStyle(.plain)
+                            .help("Remove")
+                    }
+                }
+            }
+        }
+    }
+
+    private func add() {
+        let f = from.trimmingCharacters(in: .whitespaces)
+        let t = to.trimmingCharacters(in: .whitespaces)
+        guard !f.isEmpty, !t.isEmpty else { return }
+        var list = core.settings.dictionary.filter { $0.from.lowercased() != f.lowercased() }
+        list.append(DictionaryEntry(from: f, to: t, case_sensitive: caseSensitive))
+        core.setDictionary(list)
+        from = ""
+        to = ""
+        caseSensitive = false
+    }
+
+    private func remove(_ i: Int) {
+        var list = core.settings.dictionary
+        list.remove(at: i)
+        core.setDictionary(list)
+    }
+}
+
+// MARK: - History
+
+struct HistoryPage: View {
+    @EnvironmentObject var core: TalkCore
+
+    private var items: [JobInfo] {
+        core.jobs.filter { $0.state != "queued" && $0.state != "playing" }
+    }
+
+    var body: some View {
+        Group { content }
+            .task { await core.refreshJobs() }
+    }
+
+    @ViewBuilder private var content: some View {
+        PageHeader(title: "History", subtitle: "The last 50 things Talk to Me read. Replay one or copy its text.")
+        if items.isEmpty {
+            Text("Nothing yet.").foregroundStyle(.secondary)
+        } else {
+            Card {
+                ForEach(Array(items.enumerated()), id: \.element.id) { i, job in
+                    if i > 0 { Divider() }
+                    row(job)
+                }
+            }
+        }
+    }
+
+    private func row(_ job: JobInfo) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text([appName(job.app), job.label].filter { !$0.isEmpty }.joined(separator: " · "))
+                        .font(.headline)
+                    if job.state != "done" { Badge(text: job.state.capitalized, color: .secondary) }
+                    Spacer()
+                    if let at = job.finishedAt {
+                        Text(at, style: .relative).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Text(job.preview).foregroundStyle(.secondary).lineLimit(2)
+                Text("\(job.chunks) sentence\(job.chunks == 1 ? "" : "s")").font(.caption).foregroundStyle(.tertiary)
+            }
+            VStack(spacing: 8) {
+                Button { core.replay(job.id) } label: { Image(systemName: "play.circle.fill").font(.title2) }
+                    .buttonStyle(.plain)
+                    .help("Read it again")
+                Button { core.copyText(job.id) } label: { Image(systemName: "doc.on.doc") }
+                    .buttonStyle(.plain)
+                    .help("Copy the text")
+            }
+            .disabled(job.has_text == false)
+        }
+        .padding(.vertical, 2)
     }
 }
 

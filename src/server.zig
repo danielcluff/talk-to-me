@@ -257,6 +257,7 @@ pub fn dispatch(s: *Server, ex: *Exchange, a: std.mem.Allocator, method: http.Me
     if (method == .POST and std.mem.eql(u8, path, "/v1/speak")) return speak(s, req, a);
     if (method == .POST and std.mem.eql(u8, path, "/v1/speak/file")) return speakFile(s, req, a);
     if (method == .GET and std.mem.eql(u8, path, "/v1/jobs")) return sendJson(req, a, .ok, .{ .jobs = try s.core.jobViews(a) });
+    if (std.mem.startsWith(u8, path, "/v1/jobs/") and (method == .GET or method == .POST)) return jobRoute(s, req, a, method, path["/v1/jobs/".len..]);
     if (method == .DELETE and std.mem.startsWith(u8, path, "/v1/jobs/")) {
         const id = parseJobId(path["/v1/jobs/".len..]) orelse return sendError(req, a, .bad_request, "bad job id");
         if (!s.core.removeJob(id)) return sendError(req, a, .not_found, "no such job");
@@ -281,6 +282,36 @@ pub fn dispatch(s: *Server, ex: *Exchange, a: std.mem.Allocator, method: http.Me
     }
     if (method == .GET and std.mem.eql(u8, path, "/v1/settings")) return sendJson(req, a, .ok, try s.core.getSettings(a));
     if (method == .PATCH and std.mem.eql(u8, path, "/v1/settings")) return patchSettings(s, req, a);
+    return sendError(req, a, .not_found, "not found");
+}
+
+/// GET /v1/jobs/{id}: the job with its full text.
+/// POST /v1/jobs/{id}/replay: speak it again now, in its source's voice.
+fn jobRoute(s: *Server, req: *Exchange, a: std.mem.Allocator, method: http.Method, rest: []const u8) !void {
+    const slash = std.mem.indexOfScalar(u8, rest, '/');
+    const id = parseJobId(if (slash) |i| rest[0..i] else rest) orelse return sendError(req, a, .bad_request, "bad job id");
+    const action = if (slash) |i| rest[i + 1 ..] else "";
+    const d = (try s.core.jobDetail(a, id)) orelse return sendError(req, a, .not_found, "no such job");
+    if (method == .GET and action.len == 0) {
+        return sendJson(req, a, .ok, .{ .job = d.view, .text = d.text });
+    }
+    if (method == .POST and std.mem.eql(u8, action, "replay")) {
+        if (d.text.len == 0) return sendError(req, a, .gone, "the text of this item is no longer kept");
+        const settings = try s.core.getSettings(a);
+        const voice: ?[]const u8 = if (settings.sources.map.get(d.view.app)) |ss| (if (ss.voice.len > 0) ss.voice else null) else null;
+        const label = if (d.view.label.len > 0)
+            try std.fmt.allocPrint(a, "{s} · {s}", .{ config.sourceName(d.view.app), d.view.label })
+        else
+            config.sourceName(d.view.app);
+        const result = try s.core.speak(.{
+            .text = d.text,
+            .format = .text,
+            .source = .{ .app = "history", .label = label },
+            .voice = voice,
+            .policy = .interrupt,
+        });
+        return respondSpeak(req, a, result);
+    }
     return sendError(req, a, .not_found, "not found");
 }
 
@@ -406,6 +437,8 @@ const SettingsPatch = struct {
     code_blocks: ?@import("text/markdown.zig").CodeBlocks = null,
     tables: ?@import("text/markdown.zig").Tables = null,
     dedupe_seconds: ?u32 = null,
+    /// replaces the whole list
+    dictionary: ?[]const config.DictionaryEntry = null,
     /// merged per source: {"sources": {"codex": {"voice": "am_michael"}}}
     sources: ?std.json.ArrayHashMap(SourcePatch) = null,
 };
@@ -435,6 +468,7 @@ fn patchSettings(s: *Server, req: *Exchange, a: std.mem.Allocator) !void {
     if (patch.code_blocks) |v| settings.code_blocks = v;
     if (patch.tables) |v| settings.tables = v;
     if (patch.dedupe_seconds) |v| settings.dedupe_seconds = v;
+    if (patch.dictionary) |d| settings.dictionary = d;
     if (patch.sources) |sp| {
         var it = sp.map.iterator();
         while (it.next()) |e| {

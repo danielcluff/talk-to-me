@@ -843,6 +843,56 @@ falls back to ad hoc (with a warning).
 - tiny-voca, Soprano, Chatterbox Turbo and ZONOS3; History; pronunciation
   dictionary; Developer ID signing and notarization; launch at login.
 
+**Phase 6 results (2026-11-19)**
+
+Models: three more voice models are in the catalog, each downloaded,
+hash-verified and tested through the server. Speed is measured on this M4
+with the portable build, as times faster than real time:
+
+| Model | Download | Speed | Memory | Notes |
+|---|---|---|---|---|
+| Kokoro 82M (recommended) | 270 MB | 2.4–2.7× | 430 MB | 28 English voices |
+| tiny-voca | 26 MB | | | 2 voices |
+| **Soprano 1.1** | 146 MB | **10–24×** | 228 MB | 1 voice, 32 kHz, fastest |
+| Chatterbox Turbo | 1.04 GB | 1.5–1.9× | 2.4 GB | 1 voice, expressive, no speed control |
+| ZONOS3 Mini | 2.0 GB | 3–6× | 2.2 GB | 10 English voices (US, UK, Irish, character), 44.1 kHz |
+
+- **Speed control per model:** `supports_speed` in the catalog. Models
+  without it get 1.0, because Chatterbox rejects other values.
+- **English voice filter by substring** (`voice_contains`, e.g. `_en-`)
+  for ZONOS3's `Name_en-Accent_G_n` voices. Accent and gender tags are parsed
+  for Kokoro, ZONOS3 and tiny-voca names.
+- **The audio player switches cleanly** between 24, 32 and 44.1 kHz.
+
+Pronunciation dictionary:
+- `settings.dictionary` holds `{from, to, case_sensitive}` entries.
+  Replacements are whole-word, the longest match wins, and they're applied
+  after markdown conversion and before sentence splitting, so code blocks are
+  unaffected.
+- `src/text/dictionary.zig` has 4 unit tests.
+- Settings has a Dictionary page (add, remove, ▶ to hear an entry).
+
+History:
+- The last 50 jobs keep their full text. The engine thread attaches it when
+  it frees the job, so the audio thread never allocates.
+- `GET /v1/jobs/{id}` returns a job with its text.
+- `POST /v1/jobs/{id}/replay` reads it again, labeled "Codex · redshift" and
+  in that source's voice.
+- Settings has a History page with relative times, Replay and Copy.
+
+Fixes:
+- `speak()` now deep-copies settings into the job arena. Before, a settings
+  change could free strings a request was still reading.
+
+Build:
+- Portable CPU code (`GGML_NATIVE=OFF`, `armv8.4-a+dotprod+fp16`, the M1
+  baseline) instead of `-mcpu=native`. Speed is within noise of the native
+  build. `-DTALK_NATIVE=ON` brings native back for local experiments.
+
+Blocked: Developer ID signing and notarization need a paid Apple Developer
+membership. Development builds are signed with the Apple Development
+certificate, which keeps Accessibility across rebuilds on this Mac.
+
 **Phase 7: the briefing agent (summaries, then the full report on request)**
 
 Agents finish with several paragraphs. Instead of reading every report in

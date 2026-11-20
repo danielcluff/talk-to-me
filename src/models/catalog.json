@@ -8,10 +8,23 @@
       "pipeline": "kokoro",
       "repo": "ggml-org/Kokoro-82M-GGUF",
       "revision": "ed4a98eab16351c7d803ff011e88267a5b036666",
-      "model": { "file": "Kokoro-82M-F32.gguf", "size": 61774240, "sha256": "be19298184f1a2577eb20e4689f1e2b315cbf474c39e113f192991fef3c85c6e" },
-      "mmproj": { "file": "mmproj-Kokoro-82M-F16.gguf", "size": 208456512, "sha256": "071d20f53b7c5d64b08a24bff5dfb77c2ea0df843a7c6c2356998a735ec6929d" },
+      "model": {
+        "file": "Kokoro-82M-F32.gguf",
+        "size": 61774240,
+        "sha256": "be19298184f1a2577eb20e4689f1e2b315cbf474c39e113f192991fef3c85c6e"
+      },
+      "mmproj": {
+        "file": "mmproj-Kokoro-82M-F16.gguf",
+        "size": 208456512,
+        "sha256": "071d20f53b7c5d64b08a24bff5dfb77c2ea0df843a7c6c2356998a735ec6929d"
+      },
       "default_voice": "af_heart",
-      "voice_prefixes": ["af_", "am_", "bf_", "bm_"],
+      "voice_prefixes": [
+        "af_",
+        "am_",
+        "bf_",
+        "bm_"
+      ],
       "supports_speed": true
     },
     {
@@ -22,10 +35,87 @@
       "pipeline": "tiny-voca",
       "repo": "ggml-org/tiny-voca-GGUF",
       "revision": "8a785351a6dac0b9168bc14bc5de635a98a7b809",
-      "model": { "file": "tiny-voca-F32.gguf", "size": 12169280, "sha256": "6cc38fe1a32ac312d906da6549a142de8cb6a2d0d1f10e63966a8f7c49be72cc" },
-      "mmproj": { "file": "mmproj-tiny-voca-F32.gguf", "size": 13641888, "sha256": "c70b6ba351335bb72bdd1ae42412f64490816c3accaec2a2c2990fbcfc33c48c" },
+      "model": {
+        "file": "tiny-voca-F32.gguf",
+        "size": 12169280,
+        "sha256": "6cc38fe1a32ac312d906da6549a142de8cb6a2d0d1f10e63966a8f7c49be72cc"
+      },
+      "mmproj": {
+        "file": "mmproj-tiny-voca-F32.gguf",
+        "size": 13641888,
+        "sha256": "c70b6ba351335bb72bdd1ae42412f64490816c3accaec2a2c2990fbcfc33c48c"
+      },
       "default_voice": "M2",
       "voice_prefixes": [],
+      "supports_speed": true
+    },
+    {
+      "id": "soprano",
+      "name": "Soprano 1.1",
+      "description": "Small, fast English model with a single natural voice.",
+      "recommended": false,
+      "pipeline": "soprano",
+      "repo": "ggml-org/Soprano-1.1-80M-GGUF",
+      "revision": "29f9f7b1871033ff9f35aa08cc6c44d2f324809a",
+      "model": {
+        "file": "Soprano-1.1-80M-Q8_0.gguf",
+        "size": 84921216,
+        "sha256": "749b45e4cfecdde096d15def0ad9311453dcaff2ad44685278281e1d0d48bb2a"
+      },
+      "mmproj": {
+        "file": "mmproj-Soprano-1.1-80M-F16.gguf",
+        "size": 60821216,
+        "sha256": "6ffe378cf5a89512bcd78d87f1b0bbcc95f76afdddaab44896bc11f144c08286"
+      },
+      "default_voice": "",
+      "voice_prefixes": [],
+      "supports_speed": false
+    },
+    {
+      "id": "chatterbox-turbo",
+      "name": "Chatterbox Turbo",
+      "description": "Expressive English voice from Resemble AI. Larger and slower.",
+      "recommended": false,
+      "pipeline": "chatterbox",
+      "repo": "ggml-org/chatterbox-turbo-GGUF",
+      "revision": "66f0393558d0ac1e0337e23a4d15f26e8eca0e12",
+      "model": {
+        "file": "chatterbox-turbo-Q8_0.gguf",
+        "size": 481791712,
+        "sha256": "c3b93d3c65327ef5affbdf6c7975475782bb29bc70357c7e863e2d564cadf70f"
+      },
+      "mmproj": {
+        "file": "mmproj-chatterbox-turbo-F16.gguf",
+        "size": 555371392,
+        "sha256": "de86b2ead959ba7ffc487ac2ba278e99aed0ef3b5bd04f083352b36c9b86738f"
+      },
+      "default_voice": "default",
+      "voice_prefixes": [],
+      "supports_speed": false
+    },
+    {
+      "id": "zonos3-mini",
+      "name": "ZONOS3 Mini",
+      "description": "Many American and British voices from Zyphra, with speed control. The largest option.",
+      "recommended": false,
+      "pipeline": "zonos3",
+      "repo": "ggml-org/ZONOS3-Mini-GGUF",
+      "revision": "2e7bc4126a2343787298e1a297a3d1c4a13165aa",
+      "model": {
+        "file": "ZONOS3-Mini-Q8_0.gguf",
+        "size": 854726208,
+        "sha256": "60568efc88e2f9231f4f5c061e246421f575986642d72ab9ae68f77d6cf76be4"
+      },
+      "mmproj": {
+        "file": "mmproj-ZONOS3-Mini-F32.gguf",
+        "size": 1142502880,
+        "sha256": "aeeb92325b4b6927bef656390b78e1246148065f947d8b59c2663557a809414d"
+      },
+      "default_voice": "Savannah_en-American_F_1",
+      "voice_prefixes": [],
+      "voice_contains": [
+        "_en-"
+      ],
       "supports_speed": true
     }
   ]

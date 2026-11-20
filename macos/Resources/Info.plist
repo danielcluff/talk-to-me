@@ -26,6 +26,12 @@
     <true/>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <!-- briefings: listening for "yes" / "no" after "Want the full report?" -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Talk to Me listens for a few seconds after it asks whether you want the full report, so you can answer yes or no.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Talk to Me recognizes "yes" or "no" on this Mac when it asks whether you want the full report.</string>
+
     <!-- shown when Read Selection first asks to see Finder's selected files -->
     <key>NSAppleEventsUsageDescription</key>
     <string>Talk to Me reads the Markdown and text files you select in Finder.</string>

@@ -15,7 +15,7 @@ struct TalkToMeApp: App {
         } label: {
             // the waveform is the icon; it pulses while speaking and is
             // dimmed when no model is installed
-            Image(nsImage: MenuBarIcon.image)
+            Image(nsImage: core.listening ? MenuBarIcon.listening : MenuBarIcon.image)
                 .symbolEffect(.variableColor.iterative, isActive: core.isSpeaking)
                 .opacity(core.hasInstalledModel || core.models.isEmpty ? 1 : 0.5)
         }
@@ -29,6 +29,15 @@ enum MenuBarIcon {
     static let image: NSImage = {
         let config = NSImage.SymbolConfiguration(pointSize: 17, weight: .semibold)
         let img = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Talk to Me")!
+            .withSymbolConfiguration(config)!
+        img.isTemplate = true
+        return img
+    }()
+
+    /// While listening for "yes" / "no" after a briefing.
+    static let listening: NSImage = {
+        let config = NSImage.SymbolConfiguration(pointSize: 17, weight: .semibold)
+        let img = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "Talk to Me is listening")!
             .withSymbolConfiguration(config)!
         img.isTemplate = true
         return img
@@ -90,6 +99,10 @@ struct MenuContent: View {
         Button("Read Clipboard") { Inputs.readClipboard() }
             .globalKeyboardShortcut(.readClipboard)
         Button("Open File…") { openFile() }
+        if core.settings.briefing.enabled {
+            Button("Read Last Full Report") { core.readLastReport() }
+                .globalKeyboardShortcut(.readLastReport)
+        }
         Divider()
 
         queueMenu
@@ -102,6 +115,14 @@ struct MenuContent: View {
     }
 
     @ViewBuilder private var statusLine: some View {
+        if core.awaitingAnswer {
+            Text(core.listening ? "Want the full report? Listening…" : "Want the full report?")
+            Button("Yes, Read It") { core.answer(true) }
+            Button("No") { core.answer(false) }
+            Divider()
+        } else if let b = core.briefingStatus {
+            Text(b)
+        }
         let p = core.player
         switch p.state {
         case "playing", "paused":

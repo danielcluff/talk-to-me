@@ -11,6 +11,7 @@ extension KeyboardShortcuts.Name {
     static let stopSpeaking = Self("stopSpeaking", initial: .init(.x, modifiers: [.option, .shift]))
     static let readClipboard = Self("readClipboard")
     static let skipItem = Self("skipItem")
+    static let readLastReport = Self("readLastReport")
 }
 
 @MainActor
@@ -21,6 +22,7 @@ enum Hotkeys {
         KeyboardShortcuts.onKeyUp(for: .stopSpeaking) { TalkCore.shared.command("stop") }
         KeyboardShortcuts.onKeyUp(for: .readClipboard) { Inputs.readClipboard() }
         KeyboardShortcuts.onKeyUp(for: .skipItem) { TalkCore.shared.command("skip") }
+        KeyboardShortcuts.onKeyUp(for: .readLastReport) { TalkCore.shared.readLastReport() }
     }
 }
 
@@ -33,6 +35,11 @@ enum Inputs {
     /// The Read Selection hotkey: selected .md/.txt files when Finder is in
     /// front, otherwise the selected text of the focused app.
     static func readSelection() {
+        // during "Want the full report?" the hotkey means yes
+        if TalkCore.shared.awaitingAnswer {
+            TalkCore.shared.answer(true)
+            return
+        }
         let front = NSWorkspace.shared.frontmostApplication
         if front?.bundleIdentifier == "com.apple.finder" {
             let files = finderSelection()

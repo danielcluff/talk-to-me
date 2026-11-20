@@ -4,7 +4,7 @@ import ServiceManagement
 import SwiftUI
 
 enum SettingsPage: String, CaseIterable, Identifiable {
-    case general, models, voices, sources, dictionary, history, shortcuts, permissions, about
+    case general, models, voices, sources, briefing, dictionary, history, shortcuts, permissions, about
     var id: String { rawValue }
 
     var title: String {
@@ -13,6 +13,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .models: "Models"
         case .voices: "Voices"
         case .sources: "Sources"
+        case .briefing: "Briefing"
         case .dictionary: "Dictionary"
         case .history: "History"
         case .shortcuts: "Shortcuts"
@@ -27,6 +28,7 @@ enum SettingsPage: String, CaseIterable, Identifiable {
         case .models: "cpu"
         case .voices: "person.wave.2"
         case .sources: "app.connected.to.app.below.fill"
+        case .briefing: "text.bubble"
         case .dictionary: "character.book.closed"
         case .history: "clock.arrow.circlepath"
         case .shortcuts: "keyboard"
@@ -93,6 +95,7 @@ struct SettingsView: View {
                     case .models: ModelsPage()
                     case .voices: VoicesPage()
                     case .sources: SourcesPage()
+                    case .briefing: BriefingPage()
                     case .dictionary: DictionaryPage()
                     case .history: HistoryPage()
                     case .shortcuts: ShortcutsPage()
@@ -481,6 +484,11 @@ struct SourcesPage: View {
             Text(i.detail).foregroundStyle(.secondary)
             Divider()
             Toggle("Read its replies aloud", isOn: Binding(get: { src.enabled }, set: { core.updateSource(i.app, ["enabled": $0]) }))
+            if core.settings.briefing.enabled && i.app != "herdr" {
+                Toggle("Brief me: summarize long replies and offer the full report",
+                       isOn: Binding(get: { src.brief }, set: { core.updateSource(i.app, ["brief": $0]) }))
+                    .disabled(!src.enabled)
+            }
             Toggle("Say its name first (\u{201C}\(i.name.components(separatedBy: " ").first ?? i.name), in my-project.\u{201D})",
                    isOn: Binding(get: { src.announce }, set: { core.updateSource(i.app, ["announce": $0]) }))
             Picker("Voice", selection: Binding(get: { src.voice }, set: { core.updateSource(i.app, ["voice": $0]) })) {
@@ -491,6 +499,117 @@ struct SourcesPage: View {
             }
             .disabled(!src.enabled)
         }
+    }
+}
+
+// MARK: - Briefing
+
+struct BriefingPage: View {
+    @EnvironmentObject var core: TalkCore
+    @State private var model = ""
+    @State private var yesWords = ""
+    @State private var noWords = ""
+
+    private var b: BriefingSettings { core.settings.briefing }
+
+    private let backends: [(id: String, name: String, hint: String, cloud: String?)] = [
+        ("codex", "Codex", "e.g. gpt-6-luna (fast and light). Empty uses your Codex default.", "OpenAI"),
+        ("claude", "Claude Code", "e.g. haiku or sonnet. Empty uses your Claude Code default.", "Anthropic"),
+        ("opencode", "OpenCode", "provider/model, e.g. ollama/qwen2.5-coder:7b. Empty uses your OpenCode default.", "your OpenCode provider"),
+        ("ollama", "Ollama", "a model you've pulled, e.g. qwen3:4b.", nil),
+    ]
+
+    var body: some View {
+        Group { content }
+            .onAppear {
+                model = b.model
+                yesWords = b.yes_words.joined(separator: ", ")
+                noWords = b.no_words.joined(separator: ", ")
+            }
+    }
+
+    @ViewBuilder private var content: some View {
+        PageHeader(title: "Briefing", subtitle: "Hear a short summary of each agent's report, then answer whether you want the whole thing.")
+
+        Card {
+            Toggle("Brief me on agent replies", isOn: Binding(get: { b.enabled }, set: { core.updateBriefing(["enabled": $0]) }))
+                .font(.headline)
+            Text("When Claude Code, Codex or OpenCode finishes a long reply, a summarizer you pick writes one to three sentences. Talk to Me reads them and asks \u{201C}Want the full report?\u{201D} Say yes or no, or press \u{2325}\u{21E7}R for yes. Files, selections and browser reads are always read in full.")
+                .foregroundStyle(.secondary)
+        }
+
+        SectionTitle(text: "Summarizer")
+        Card {
+            Picker("Use", selection: Binding(get: { b.backend }, set: { core.updateBriefing(["backend": $0]) })) {
+                ForEach(backends, id: \.id) { Text($0.name).tag($0.id) }
+            }
+            .pickerStyle(.segmented)
+            let current = backends.first { $0.id == b.backend } ?? backends[0]
+            HStack {
+                TextField("Model", text: $model)
+                    .onSubmit { core.updateBriefing(["model": model]) }
+                Button("Save") { core.updateBriefing(["model": model]) }
+            }
+            Text(current.hint).font(.callout).foregroundStyle(.secondary)
+            if b.backend == "ollama" {
+                TextField("Ollama URL", text: Binding(get: { b.ollama_url }, set: { core.updateBriefing(["ollama_url": $0]) }))
+            }
+            if let cloud = current.cloud {
+                Label("Reports are sent to \(cloud) to be summarized.", systemImage: "network")
+                    .font(.callout).foregroundStyle(.orange)
+            } else {
+                Label("Reports stay on this Mac.", systemImage: "lock")
+                    .font(.callout).foregroundStyle(.green)
+            }
+            Text("Local models running inside Talk to Me are coming next.").font(.callout).foregroundStyle(.secondary)
+            HStack {
+                Stepper("Brief replies longer than \(b.min_words) words", value: Binding(get: { b.min_words }, set: { core.updateBriefing(["min_words": $0]) }), in: 20...400, step: 10)
+            }
+            Stepper("Give up after \(b.timeout_seconds) seconds and read the first paragraph", value: Binding(get: { b.timeout_seconds }, set: { core.updateBriefing(["timeout_seconds": $0]) }), in: 5...120, step: 5)
+            HStack {
+                Button("Test with a Sample Report") { core.testBriefing() }
+                    .buttonStyle(.borderedProminent)
+                Text("Summarizes a made-up report and reads the briefing, question included.").font(.callout).foregroundStyle(.secondary)
+            }
+        }
+
+        SectionTitle(text: "Answering")
+        Card {
+            Toggle("Listen for \u{201C}yes\u{201D} or \u{201C}no\u{201D} after the question", isOn: Binding(get: { b.listen }, set: { core.updateBriefing(["listen": $0]) }))
+            HStack {
+                Text("Listen for")
+                Slider(value: Binding(get: { Double(b.listen_seconds) }, set: { core.updateBriefing(["listen_seconds": Int($0)]) }), in: 2...8, step: 1)
+                Text("\(b.listen_seconds) s").monospacedDigit().frame(width: 32)
+            }
+            Picker("Recognizer", selection: Binding(get: { b.recognizer }, set: { core.updateBriefing(["recognizer": $0]) })) {
+                Text("Apple, on this Mac (no download)").tag("apple")
+            }
+            HStack {
+                Text("Yes words")
+                TextField("", text: $yesWords).onSubmit { saveWords() }
+            }
+            HStack {
+                Text("No words")
+                TextField("", text: $noWords).onSubmit { saveWords() }
+            }
+            Text("Silence, or anything else, counts as no answer: the report stays in Read Last Full Report and History.")
+                .font(.callout).foregroundStyle(.secondary)
+            if !(Listener.speechAuthorized() && Listener.micAuthorized()) {
+                Button("Allow Microphone and Speech Recognition…") {
+                    Listener.requestPermissions { _ in }
+                }
+            }
+        }
+        if let err = core.lastError {
+            Text(err).foregroundStyle(.red).font(.callout)
+        }
+    }
+
+    private func saveWords() {
+        func split(_ s: String) -> [String] {
+            s.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
+        }
+        core.updateBriefing(["yes_words": split(yesWords), "no_words": split(noWords)])
     }
 }
 
@@ -656,10 +775,11 @@ struct ShortcutsPage: View {
 struct PermissionsPage: View {
     @State private var accessibility = Permissions.accessibilityGranted()
     @State private var finder = Permissions.finderAutomation(ask: false)
+    @State private var speech = Listener.speechAuthorized() && Listener.micAuthorized()
     private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
-        PageHeader(title: "Permissions", subtitle: "Only needed for the Read Selection hotkey.")
+        PageHeader(title: "Permissions", subtitle: "Only needed for Read Selection and for answering briefings by voice.")
         Card {
             permissionRow(
                 title: "Accessibility",
@@ -681,11 +801,21 @@ struct PermissionsPage: View {
                     finder = Permissions.finderAutomation(ask: false)
                 })
         }
+        Card {
+            permissionRow(
+                title: "Microphone and Speech Recognition",
+                detail: "Hears \u{201C}yes\u{201D} or \u{201C}no\u{201D} after a briefing asks whether you want the full report. Recognition runs on this Mac.",
+                granted: speech,
+                action: {
+                    Listener.requestPermissions { _ in speech = Listener.speechAuthorized() && Listener.micAuthorized() }
+                })
+        }
         Text("A development build is signed ad hoc, so macOS may ask again after each rebuild. Signed releases keep the permission.")
             .font(.callout).foregroundStyle(.secondary)
             .onReceive(timer) { _ in
                 accessibility = Permissions.accessibilityGranted()
                 finder = Permissions.finderAutomation(ask: false)
+                speech = Listener.speechAuthorized() && Listener.micAuthorized()
             }
     }
 

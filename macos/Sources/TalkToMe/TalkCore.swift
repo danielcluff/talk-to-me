@@ -78,6 +78,7 @@ struct Settings: Codable, Equatable {
     var dedupe_seconds: Int = 30
     var sources: [String: SourceSetting] = [:]
     var dictionary: [DictionaryEntry] = []
+    var briefing = BriefingSettings()
 
     init() {}
 
@@ -93,7 +94,22 @@ struct Settings: Codable, Equatable {
         dedupe_seconds = try c.decodeIfPresent(Int.self, forKey: .dedupe_seconds) ?? 30
         sources = try c.decodeIfPresent([String: SourceSetting].self, forKey: .sources) ?? [:]
         dictionary = try c.decodeIfPresent([DictionaryEntry].self, forKey: .dictionary) ?? []
+        briefing = try c.decodeIfPresent(BriefingSettings.self, forKey: .briefing) ?? BriefingSettings()
     }
+}
+
+struct BriefingSettings: Codable, Equatable {
+    var enabled = false
+    var backend = "codex"
+    var model = ""
+    var ollama_url = "http://127.0.0.1:11434"
+    var min_words = 60
+    var timeout_seconds = 30
+    var listen = true
+    var listen_seconds = 4
+    var recognizer = "apple"
+    var yes_words: [String] = ["yes", "yeah", "yep", "sure", "read it", "go ahead", "okay", "ok", "please"]
+    var no_words: [String] = ["no", "nope", "skip", "not now", "later", "no thanks"]
 }
 
 struct DictionaryEntry: Codable, Equatable, Hashable {
@@ -106,6 +122,7 @@ struct SourceSetting: Codable, Equatable {
     var enabled: Bool = true
     var voice: String = ""
     var announce: Bool = false
+    var brief: Bool = true
 }
 
 /// Agents Talk to Me integrates with: settings key (source app) and the
@@ -255,6 +272,28 @@ final class TalkCore: ObservableObject {
             askToPair(id: id, code: e.state ?? "")
             return
         }
+        switch e.type {
+        case "briefing":
+            briefingStatus = e.state == "summarizing" ? "Summarizing a reply…" : nil
+            return
+        case "ask":
+            awaitingAnswer = true
+            let b = settings.briefing
+            if b.listen && b.recognizer == "apple" {
+                listening = true
+                Listener.shared.listen(seconds: e.index ?? b.listen_seconds, yes: b.yes_words, no: b.no_words) { [weak self] yes in
+                    self?.answer(yes)
+                }
+            }
+            return
+        case "answered":
+            awaitingAnswer = false
+            listening = false
+            Listener.shared.stop()
+            return
+        default:
+            break
+        }
         Task {
             switch e.type {
             case "model_state":
@@ -268,6 +307,25 @@ final class TalkCore: ObservableObject {
             }
         }
     }
+
+    // MARK: briefings
+
+    @Published var briefingStatus: String?
+    @Published var awaitingAnswer = false
+    @Published var listening = false
+
+    func answer(_ yes: Bool) {
+        awaitingAnswer = false
+        listening = false
+        Listener.shared.stop()
+        Task { await send("POST", "/v1/briefing/answer", ["answer": yes ? "yes" : "no"]) }
+    }
+
+    func readLastReport() { Task { await send("POST", "/v1/briefing/last") } }
+
+    func testBriefing() { Task { await send("POST", "/v1/briefing/test") } }
+
+    func updateBriefing(_ patch: [String: Any]) { update(["briefing": patch]) }
 
     // MARK: browser pairing
 

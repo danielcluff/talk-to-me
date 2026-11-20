@@ -787,6 +787,19 @@ short summary, then asks whether you want the whole thing.
    - Pressing the Read Selection hotkey during the window also counts as
      yes, for when talking isn't convenient.
 
+*Only model replies are briefed.* Summaries apply to agent replies, never to
+things you asked to hear:
+- **Briefed:** agent replies from Claude Code, Codex and OpenCode (their
+  hooks), the browser extension's auto-read of ChatGPT and Claude replies
+  (Phase 5), and MCP `speak` calls longer than the summary would be.
+- **Always read in full:** files (CLI, Open With, Services, Finder via the
+  hotkey), selections, the clipboard, piped text, the browser's "read page"
+  and "read selection", herdr's short "X finished" notices, and voice
+  previews.
+- The rule is enforced in the core by source type, not only by settings, so
+  a new input can't be briefed by accident. Reading a file with the `brief`
+  policy is rejected.
+
 *How it fits the existing design*
 - **A new policy, `brief`.** It's the default for agent sources once the
   briefing agent is on, and can be set per source in Settings → Sources, so
@@ -872,8 +885,9 @@ is the one that costs almost nothing.
 Qwen3-ASR 1.1 GB come to about 3.3 GB. With Codex as the summarizer and
 Apple speech: about 0.45 GB, the same as today.
 
-*Every download is visible and deletable.* This applies to all model kinds
-(voices, summarizers, recognizers), and the Models page shows it now:
+*Every download is visible and deletable* (built in this phase, together
+with the new model kinds). This applies to all of them (voices, summarizers,
+recognizers):
 - Each installed model shows its folder
   (`~/Library/Application Support/TalkToMe/models/<id>/`), the files in it
   and their size on disk, with "Show in Finder" and "Delete…".

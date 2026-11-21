@@ -16,6 +16,9 @@ async function listen(api, token) {
         signal: signal
       });
       if (!res.ok || !res.body) throw new Error("HTTP " + res.status);
+      attempt = 0;
+      // events sent before this point were missed: let the worker catch up
+      chrome.runtime.sendMessage({ from: "offscreen", t: "connected" }).catch(() => {});
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buf = "";

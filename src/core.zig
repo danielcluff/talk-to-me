@@ -22,6 +22,7 @@ const models = @import("models/models.zig");
 const markdown = @import("text/markdown.zig");
 const chunker = @import("text/chunk.zig");
 const dictionary = @import("text/dictionary.zig");
+const utf8 = @import("text/utf8.zig");
 const briefing = @import("briefing.zig");
 
 const log = std.log.scoped(.core);
@@ -120,6 +121,10 @@ const Job = struct {
     created_ms: i64,
     /// a briefing: when it finishes, hold the queue for "want the full report?"
     ask: bool = false,
+    /// audio[0..freed_upto] was played and freed (see dropPlayedAudio)
+    freed_upto: usize = 0,
+    /// chunks whose synthesis failed (played as silence and skipped)
+    failed_chunks: usize = 0,
 };
 
 const BriefTask = struct {
@@ -164,7 +169,7 @@ pub const Summary = struct {
     }
 };
 
-pub const EventKind = enum { job_queued, job_started, chunk_started, job_finished, player_state, model_state, pair_request, briefing, ask, answered };
+pub const EventKind = enum { job_queued, job_started, chunk_started, chunk_failed, job_finished, player_state, model_state, pair_request, briefing, ask, answered };
 
 pub const Event = struct {
     seq: u64 = 0,
@@ -211,6 +216,9 @@ pub const Core = struct {
     // settings (strings owned by settings_arena), guarded by mu
     settings_arena: std.heap.ArenaAllocator,
     settings: config.Settings,
+    /// held across a read-modify-write of the settings (see editSettings),
+    /// so two clients changing different keys at once both land
+    settings_edit_mu: Mutex = .{},
 
     // queue, guarded by mu
     next_id: u64 = 1,
@@ -228,6 +236,10 @@ pub const Core = struct {
     /// set when history changes (also on the audio thread); the engine thread saves it
     history_dirty: bool = false,
     history_head: usize = 0,
+    /// bumped by Clear History, so a save of an older snapshot is dropped
+    history_gen: u64 = 0,
+    /// serializes writes of history.json (taken before mu, never inside it)
+    history_io_mu: Mutex = .{},
 
     // events, guarded by mu
     events: [event_ring]Event = undefined,
@@ -264,7 +276,9 @@ pub const Core = struct {
     brief_cv: Cond = .{},
     brief_thread: ?std.Thread = null,
     hold: ?Hold = null,
-    last_report: ?Report = null,
+    /// full reports behind recent briefings, oldest first (the last one is
+    /// what "read the last report" reads); each briefing finds its own
+    reports: std.ArrayList(Report) = .empty,
     // local speech recognizer for answers, guarded by asr_mu (never take mu inside)
     asr_mu: Mutex = .{},
     asr: ?*c.te_asr = null,
@@ -308,7 +322,8 @@ pub const Core = struct {
             self.gpa.destroy(t);
         }
         self.brief_tasks.deinit(self.gpa);
-        if (self.last_report) |r| self.freeReport(r);
+        for (self.reports.items) |r| self.freeReport(r);
+        self.reports.deinit(self.gpa);
         if (self.download_thread) |t| t.join();
         self.player_mu.lock();
         if (self.player) |p| c.ta_player_free(p);
@@ -370,7 +385,20 @@ pub const Core = struct {
         return dupeSettings(arena, self.settings);
     }
 
+    /// Start a read-modify-write of the settings: returns a copy to change and
+    /// pass to setSettings. Always pair with endEdit().
+    pub fn beginEdit(self: *Core, arena: std.mem.Allocator) !config.Settings {
+        self.settings_edit_mu.lock();
+        errdefer self.settings_edit_mu.unlock();
+        return self.getSettings(arena);
+    }
+
+    pub fn endEdit(self: *Core) void {
+        self.settings_edit_mu.unlock();
+    }
+
     /// Replace the settings (already validated by the caller) and persist them.
+    /// Callers that derive `s` from the current settings hold beginEdit().
     pub fn setSettings(self: *Core, s: config.Settings) !void {
         if (self.catalog.find(s.model) == null) return error.UnknownModel;
         var fresh: std.heap.ArenaAllocator = .init(self.gpa);
@@ -378,6 +406,8 @@ pub const Core = struct {
         const copy = try dupeSettings(fresh.allocator(), s);
         try config.saveSettings(self.gpa, self.io, self.paths, copy);
         self.mu.lock();
+        // a load that failed for the old model must not block the new one
+        if (!std.mem.eql(u8, self.settings.model, copy.model) and self.load_state == .failed) self.load_state = .unloaded;
         self.settings_arena.deinit();
         self.settings_arena = fresh;
         self.settings = copy;
@@ -481,12 +511,14 @@ pub const Core = struct {
     }
 
     fn copyTrunc(dst: []u8, src: []const u8) void {
-        const n = @min(dst.len - 1, src.len);
-        @memcpy(dst[0..n], src[0..n]);
-        dst[n] = 0;
+        utf8.copyZ(dst, src);
     }
 
+    /// Voice and pronunciation previews from Settings: not worth keeping.
+    pub const preview_app = "preview";
+
     fn recordHistory(self: *Core, j: *const Job, state: JobState) void {
+        if (std.mem.eql(u8, j.source.app, preview_app)) return;
         var sum = summarize(j, state);
         var now: std.c.timespec = undefined;
         if (std.c.clock_gettime(.REALTIME, &now) == 0) sum.finished_ms = @as(i64, now.sec) * 1000 + @divTrunc(@as(i64, now.nsec), std.time.ns_per_ms);
@@ -526,6 +558,11 @@ pub const Core = struct {
         // keep the newest history_len, oldest first
         const keep = items[items.len -| history_len ..];
         for (keep) |it| {
+            // saved before previews were left out of history
+            if (std.mem.eql(u8, it.app, preview_app)) {
+                self.history_dirty = true; // rewrite the file without them
+                continue;
+            }
             var sum: Summary = .{ .id = it.id, .chunks = it.chunks, .state = it.state, .finished_ms = it.finished_ms };
             copyTrunc(&sum.app, it.app);
             copyTrunc(&sum.label, it.label);
@@ -576,9 +613,26 @@ pub const Core = struct {
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
         const items = self.snapshotHistory(arena.allocator()) catch return;
+        const gen = self.history_gen;
         self.mu.unlock();
         defer self.mu.lock();
+        self.history_io_mu.lock();
+        defer self.history_io_mu.unlock();
+        // History was cleared since the snapshot: writing it would bring it back
+        self.mu.lock();
+        const stale = self.history_gen != gen;
+        self.mu.unlock();
+        if (stale) return;
         self.writeHistory(arena.allocator(), items) catch |err| log.warn("could not save history.json: {t}", .{err});
+    }
+
+    /// Save history now if it changed (quitting).
+    pub fn flushHistory(self: *Core) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        // jobs retired since the engine thread last ran keep their text there
+        for (self.graveyard.items) |j| self.keepHistoryText(j);
+        self.saveHistoryIfDirty();
     }
 
     /// Forget every history item, in memory and on disk.
@@ -591,14 +645,18 @@ pub const Core = struct {
             t.* = null;
         }
         self.history_dirty = false;
+        self.history_gen += 1;
         self.mu.unlock();
+        self.history_io_mu.lock();
+        defer self.history_io_mu.unlock();
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
         try self.writeHistory(arena.allocator(), &.{});
     }
 
     /// Retire a job (caller holds mu). The engine thread frees it later.
-    fn retire(self: *Core, j: *Job, reason: FinishReason) void {
+    fn retire(self: *Core, j: *Job, reason_in: FinishReason) void {
+        const reason = effectiveReason(j, reason_in);
         const state: JobState = switch (reason) {
             .done => .done,
             .skipped => .skipped,
@@ -612,6 +670,13 @@ pub const Core = struct {
         self.pushEvent((Event{ .kind = .job_finished, .job = j.id, .count = @intCast(j.chunks.len) }).withState(@tagName(reason)));
         self.graveyard.append(self.gpa, j) catch self.freeJobLater(j);
         self.work_cv.signal();
+    }
+
+    /// A job that "finished" without a single sentence synthesized failed:
+    /// say so in its status instead of reporting silence as done.
+    fn effectiveReason(j: *const Job, reason: FinishReason) FinishReason {
+        if (reason == .done and j.chunks.len > 0 and j.failed_chunks >= j.chunks.len) return .failed;
+        return reason;
     }
 
     fn freeJobLater(self: *Core, j: *Job) void {
@@ -636,7 +701,7 @@ pub const Core = struct {
     fn advanceJob(self: *Core, reason: FinishReason) void {
         if (self.current) |j| {
             self.current = null;
-            const ask = j.ask and reason == .done;
+            const ask = j.ask and effectiveReason(j, reason) == .done;
             self.retire(j, reason);
             if (ask) {
                 // "Want the full report?": hold the queue for the answer
@@ -742,9 +807,11 @@ pub const Core = struct {
         j.voice = try a.dupe(u8, req.voice orelse source_voice orelse "");
         j.speed = req.speed orelse s.speed;
         const first = j.chunks[if (j.chunks.len > 1 and src != null and src.?.announce and !req.no_announce) 1 else 0].text;
-        j.preview = first[0..@min(first.len, 119)];
+        j.preview = utf8.prefix(first, 119);
         j.hash = hashText(j.source.app, j.chunks);
         j.ask = req.kind == .briefing;
+        j.freed_upto = 0;
+        j.failed_chunks = 0;
         j.created_ms = self.nowMs();
 
         self.mu.lock();
@@ -789,9 +856,13 @@ pub const Core = struct {
                 self.current = null;
                 self.retire(cur, .interrupted);
             }
+            // something you started yourself ends a waiting question
+            self.dropHold("interrupted");
             self.paused = false;
             self.startJob(j);
-        } else if (self.current == null) {
+        } else if (self.current == null and self.hold == null) {
+            // while "Want the full report?" waits for an answer, new speech
+            // queues: the microphone is open and must not hear the app
             self.startJob(j);
         } else {
             self.pending.append(self.gpa, j) catch |err| {
@@ -839,6 +910,7 @@ pub const Core = struct {
             .@"resume" => self.paused = false,
             .toggle => self.paused = !self.paused,
             .stop => {
+                self.dropHold("stopped");
                 for (self.pending.items) |p| self.retire(p, .stopped);
                 self.pending.clearRetainingCapacity();
                 if (self.current) |cur| {
@@ -847,7 +919,8 @@ pub const Core = struct {
                 }
                 self.paused = false;
             },
-            .skip => self.advanceJob(.skipped),
+            // skipping while a question waits skips the question
+            .skip => if (self.current == null and self.hold != null) self.endHold("skipped") else self.advanceJob(.skipped),
             .next => if (self.current) |cur| {
                 if (self.cursor_chunk + 1 >= cur.chunks.len) {
                     self.advanceJob(.skipped);
@@ -862,6 +935,8 @@ pub const Core = struct {
                 // restart the sentence if more than 1.5 s in, else go back one
                 const threshold = (self.sample_rate * 3) / 2;
                 if (self.cursor_sample <= threshold and self.cursor_chunk > 0) self.cursor_chunk -= 1;
+                // going back past freed audio re-synthesizes it; free it again later
+                if (self.current) |cur| cur.freed_upto = @min(cur.freed_upto, self.cursor_chunk);
                 self.cursor_sample = 0;
                 self.gap_left = 0;
                 self.chunk_announced = false;
@@ -953,7 +1028,12 @@ pub const Core = struct {
     }
 
     fn makeWork(self: *Core, a: std.mem.Allocator, j: *Job, i: usize) !Work {
-        const voice = if (j.voice.len > 0) j.voice else self.resolveVoice();
+        // a voice from the request or the source that this model lacks (e.g.
+        // a Kokoro voice after switching models) falls back instead of failing
+        const voice = if (j.voice.len > 0 and self.hasVoice(j.voice)) j.voice else blk: {
+            if (j.voice.len > 0 and i == 0) log.warn("voice {s} is not in {s}; using the default", .{ j.voice, self.engine_model });
+            break :blk self.resolveVoice();
+        };
         return .{
             .job = j,
             .index = i,
@@ -964,15 +1044,36 @@ pub const Core = struct {
         };
     }
 
+    fn hasVoice(self: *Core, name: []const u8) bool {
+        for (self.voices.items) |v| if (std.mem.eql(u8, v, name)) return true;
+        return false;
+    }
+
     /// Settings voice if it belongs to the loaded model, else the model default.
     fn resolveVoice(self: *Core) []const u8 {
         const m = self.catalog.find(self.engine_model) orelse return "";
-        if (self.settings.voice.len > 0) {
-            for (self.voices.items) |v| {
-                if (std.mem.eql(u8, v, self.settings.voice)) return self.settings.voice;
+        if (self.settings.voice.len > 0 and self.hasVoice(self.settings.voice)) return self.settings.voice;
+        return m.default_voice;
+    }
+
+    /// Chunks kept behind the cursor, for "previous sentence"; older ones are
+    /// freed so a long reading doesn't keep all its audio (~5 MB a minute).
+    /// A freed chunk is synthesized again if playback goes back to it.
+    const keep_behind = 3;
+
+    /// Engine thread, with mu held (pull() only reads PCM under mu).
+    fn dropPlayedAudio(self: *Core) void {
+        const j = self.current orelse return;
+        if (self.cursor_chunk <= keep_behind) return;
+        const end = self.cursor_chunk - keep_behind;
+        if (j.freed_upto >= end) return;
+        for (j.audio[j.freed_upto..end]) |*slot| {
+            if (slot.*) |pcm| {
+                if (pcm.len > 0) self.gpa.free(pcm);
+                slot.* = null;
             }
         }
-        return m.default_voice;
+        j.freed_upto = end;
     }
 
     fn engineMain(self: *Core) void {
@@ -1013,6 +1114,7 @@ pub const Core = struct {
                 continue;
             }
 
+            self.dropPlayedAudio();
             const work = self.pickWork(scratch.allocator()) catch null;
             if (work) |w| {
                 self.last_active_ms = self.nowMs();
@@ -1023,6 +1125,11 @@ pub const Core = struct {
                 // the job may be retired meanwhile; it is still allocated
                 // (only this thread frees), so storing is safe
                 w.job.audio[w.index] = pcm;
+                if (pcm.len == 0) {
+                    w.job.failed_chunks += 1;
+                    // tell listeners which sentence was skipped
+                    self.pushEvent((Event{ .kind = .chunk_failed, .job = w.job.id, .index = @intCast(w.index), .count = @intCast(w.job.chunks.len) }).withState("failed"));
+                }
                 const is_current = self.current == w.job;
                 self.mu.unlock();
                 if (is_current) self.ensurePlaying();
@@ -1119,18 +1226,19 @@ pub const Core = struct {
             }
         } else |_| {}
 
+        // build the voice list off to the side; API threads read self.voices under mu
         var voices_ok = true;
+        var new_arena: std.heap.ArenaAllocator = .init(self.gpa);
+        var new_voices: std.ArrayList([]const u8) = .empty;
         if (engine) |e| {
-            _ = self.voices_arena.reset(.retain_capacity);
-            self.voices = .empty;
-            const va = self.voices_arena.allocator();
+            const va = new_arena.allocator();
             var i: i32 = 0;
             while (c.te_voice_name(e, i)) |name| : (i += 1) {
                 const v = va.dupe(u8, std.mem.span(name)) catch {
                     voices_ok = false;
                     break;
                 };
-                self.voices.append(va, v) catch {
+                new_voices.append(va, v) catch {
                     voices_ok = false;
                     break;
                 };
@@ -1141,6 +1249,10 @@ pub const Core = struct {
         self.mu.lock();
         self.load_requested = false;
         if (engine) |e| {
+            var old_arena = self.voices_arena;
+            self.voices_arena = new_arena;
+            self.voices = new_voices;
+            old_arena.deinit();
             self.engine = e;
             self.sample_rate = @intCast(c.te_sample_rate(e));
             self.channels = @intCast(@max(1, c.te_channels(e)));
@@ -1148,6 +1260,7 @@ pub const Core = struct {
             self.pushEvent((Event{ .kind = .model_state }).withState("loaded"));
             log.info("loaded {s} ({d} voices, {d} Hz)", .{ m.id, self.voices.items.len, self.sample_rate });
         } else {
+            new_arena.deinit();
             self.failLoad(std.mem.sliceTo(&err, 0));
         }
         if (!voices_ok) log.warn("voice list truncated (out of memory)", .{});
@@ -1223,13 +1336,19 @@ pub const Core = struct {
 
     pub fn startDownload(self: *Core, id: []const u8) !void {
         const m = self.catalog.find(id) orelse return error.UnknownModel;
+        // join the finished thread without mu: it may still be taking mu on its way out
+        const old = blk: {
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (self.download_progress.active.load(.acquire)) return error.DownloadInProgress;
+            const t = self.download_thread;
+            self.download_thread = null;
+            break :blk t;
+        };
+        if (old) |t| t.join();
         self.mu.lock();
         defer self.mu.unlock();
-        if (self.download_progress.active.load(.acquire)) return error.DownloadInProgress;
-        if (self.download_thread) |t| {
-            t.join();
-            self.download_thread = null;
-        }
+        if (self.download_progress.active.load(.acquire) or self.download_thread != null) return error.DownloadInProgress;
         self.download_model = m.id;
         self.download_progress = .{};
         self.download_progress.active.store(true, .release);
@@ -1249,8 +1368,8 @@ pub const Core = struct {
             self.mu.unlock();
             log.err("download of {s} failed: {t}", .{ m.id, err });
         };
-        self.download_progress.active.store(false, .release);
         self.resetLoadFailure();
+        self.download_progress.active.store(false, .release);
         log.info("download of {s} finished", .{m.id});
     }
 
@@ -1287,6 +1406,14 @@ pub const Core = struct {
         self.pushEvent((Event{ .kind = .briefing }).withState("summarizing"));
         self.brief_cv.signal();
         return true;
+    }
+
+    const max_reports = 8;
+
+    /// The report behind briefing job `id` (caller holds mu).
+    fn reportFor(self: *Core, id: u64) ?Report {
+        for (self.reports.items) |r| if (r.briefing_job == id) return r;
+        return null;
     }
 
     fn freeReport(self: *Core, r: Report) void {
@@ -1375,10 +1502,18 @@ pub const Core = struct {
             .text = self.gpa.dupe(u8, t.text) catch return,
         };
         self.mu.lock();
-        if (self.last_report) |old| self.freeReport(old);
-        self.last_report = report;
+        // keep a few: briefings can queue up behind each other
+        if (self.reports.items.len >= max_reports) self.freeReport(self.reports.orderedRemove(0));
+        self.reports.append(self.gpa, report) catch self.freeReport(report);
         self.pushEvent((Event{ .kind = .briefing }).withState(if (ok) "ready" else "fallback"));
         self.mu.unlock();
+    }
+
+    /// llm_id is read by modelViews under mu (catalog strings, never freed).
+    fn setLlmId(self: *Core, id: []const u8) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.llm_id = id;
     }
 
     /// Summarize with a downloaded summary model, in-process (brief thread).
@@ -1390,12 +1525,13 @@ pub const Core = struct {
         if (self.llm == null or !std.mem.eql(u8, self.llm_id, m.id)) {
             if (self.llm) |l| c.te_llm_free(l);
             self.llm = null;
+            self.setLlmId("");
             var err: [256]u8 = @splat(0);
             self.llm = c.te_llm_load(lp.model.ptr, 1, &err, err.len) orelse {
                 log.err("summary model: {s}", .{std.mem.sliceTo(&err, 0)});
                 return error.SummaryModelLoadFailed;
             };
-            self.llm_id = m.id;
+            self.setLlmId(m.id);
             log.info("loaded summary model {s}", .{m.id});
         }
         self.llm_last_ms = monoMs();
@@ -1486,6 +1622,8 @@ pub const Core = struct {
 
     /// Transcribe a recorded answer with the local recognizer and act on it.
     pub fn answerFromAudio(self: *Core, a: std.mem.Allocator, pcm: []const f32, rate: u32) !HeardAnswer {
+        if (rate < 8000 or rate > 192_000) return error.BadSampleRate;
+        if (pcm.len == 0) return error.NoAudio;
         const s = blk: {
             self.mu.lock();
             defer self.mu.unlock();
@@ -1524,6 +1662,7 @@ pub const Core = struct {
     }
 
     fn resample(a: std.mem.Allocator, pcm: []const f32, from: u32, to: u32) ![]f32 {
+        if (from == 0 or to == 0 or pcm.len == 0) return error.BadSampleRate;
         const n_out: usize = @intCast(@as(u64, pcm.len) * to / from);
         const out = try a.alloc(f32, n_out);
         const step = @as(f64, @floatFromInt(from)) / @as(f64, @floatFromInt(to));
@@ -1536,6 +1675,13 @@ pub const Core = struct {
             o.* = s0 + (s1 - s0) * frac;
         }
         return out;
+    }
+
+    /// Forget a waiting question without starting the queue (caller holds mu).
+    fn dropHold(self: *Core, how: []const u8) void {
+        const h = self.hold orelse return;
+        self.hold = null;
+        self.pushEvent((Event{ .kind = .answered, .job = h.job }).withState(how));
     }
 
     /// Release the held queue (caller holds mu).
@@ -1558,7 +1704,7 @@ pub const Core = struct {
             self.mu.lock();
             defer self.mu.unlock();
             const h = self.hold orelse return .no_question;
-            if (yes) if (self.last_report) |r| if (r.briefing_job == h.job) {
+            if (yes) if (self.reportFor(h.job)) |r| {
                 report = .{
                     .briefing_job = r.briefing_job,
                     .app = try self.gpa.dupe(u8, r.app),
@@ -1595,7 +1741,8 @@ pub const Core = struct {
         {
             self.mu.lock();
             defer self.mu.unlock();
-            const r = self.last_report orelse return false;
+            if (self.reports.items.len == 0) return false;
+            const r = self.reports.items[self.reports.items.len - 1];
             copy = .{
                 .briefing_job = r.briefing_job,
                 .app = try self.gpa.dupe(u8, r.app),
@@ -1742,8 +1889,32 @@ pub const Core = struct {
 
     pub fn modelViews(self: *Core, a: std.mem.Allocator) ![]ModelView {
         var out: std.ArrayList(ModelView) = .empty;
-        self.mu.lock();
-        defer self.mu.unlock();
+        // copy what's needed under mu, then read the disk without it: the
+        // audio callback takes mu, and Settings polls this during downloads
+        const State = struct {
+            model: []const u8,
+            backend: briefing.Backend,
+            summary_model: []const u8,
+            recognizer: []const u8,
+            loaded_voice: []const u8,
+            llm_id: []const u8,
+            download_model: []const u8,
+            download_error: []const u8,
+        };
+        const st: State = blk: {
+            self.mu.lock();
+            defer self.mu.unlock();
+            break :blk .{
+                .model = try a.dupe(u8, self.settings.model),
+                .backend = self.settings.briefing.backend,
+                .summary_model = try a.dupe(u8, self.settings.briefing.model),
+                .recognizer = try a.dupe(u8, self.settings.briefing.recognizer),
+                .loaded_voice = if (self.load_state == .loaded) self.engine_model else "",
+                .llm_id = self.llm_id,
+                .download_model = self.download_model,
+                .download_error = try a.dupe(u8, std.mem.sliceTo(&self.download_error, 0)),
+            };
+        };
         for (self.catalog.all()) |m| {
             const lp = try models.localPaths(a, self.paths.models, m);
             const files = try models.diskFiles(a, self.io, lp.dir);
@@ -1753,11 +1924,10 @@ pub const Core = struct {
                 disk += f.size;
                 if (f.partial) partial += f.size;
             }
-            const b = self.settings.briefing;
             const active = switch (m.kind) {
-                .voice => std.mem.eql(u8, m.id, self.settings.model),
-                .summary => b.backend == .local and std.mem.eql(u8, m.id, b.model),
-                .listening => std.mem.eql(u8, m.id, b.recognizer),
+                .voice => std.mem.eql(u8, m.id, st.model),
+                .summary => st.backend == .local and std.mem.eql(u8, m.id, st.summary_model),
+                .listening => std.mem.eql(u8, m.id, st.recognizer),
             };
             var v: ModelView = .{
                 .id = m.id,
@@ -1768,18 +1938,18 @@ pub const Core = struct {
                 .size = m.totalSize(),
                 .installed = models.isInstalled(self.io, lp, m),
                 .active = active,
-                .loaded = (self.load_state == .loaded and std.mem.eql(u8, m.id, self.engine_model)) or std.mem.eql(u8, m.id, self.llm_id),
+                .loaded = std.mem.eql(u8, m.id, st.loaded_voice) or std.mem.eql(u8, m.id, st.llm_id),
                 .dir = lp.dir,
                 .disk_bytes = disk,
                 .partial_bytes = partial,
                 .files = files,
             };
-            if (std.mem.eql(u8, m.id, self.download_model)) {
+            if (std.mem.eql(u8, m.id, st.download_model)) {
                 v.download = .{
                     .done = self.download_progress.done.load(.monotonic),
                     .total = self.download_progress.total.load(.monotonic),
                     .active = self.download_progress.active.load(.acquire),
-                    .@"error" = try a.dupe(u8, std.mem.sliceTo(&self.download_error, 0)),
+                    .@"error" = st.download_error,
                 };
             }
             try out.append(a, v);

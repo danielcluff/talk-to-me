@@ -47,6 +47,10 @@ void    talk_free(char * p);
 // with talk_free. Call it off the main thread (it can take a second).
 char *  talk_answer_audio(const float * pcm, size_t n_samples, int32_t sample_rate);
 
+// Quitting: save what is still unsaved (history). The app then ends with
+// _exit, because the GPU backend's static destructors abort at exit().
+void    talk_prepare_exit(void);
+
 #ifdef __cplusplus
 }
 #endif

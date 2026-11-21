@@ -7,8 +7,11 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT="$ROOT/zig-out"
 APP="$OUT/TalkToMe.app"
 
-swift build -c release --package-path "$ROOT/macos" --arch arm64
 BIN=$(swift build -c release --package-path "$ROOT/macos" --arch arm64 --show-bin-path)
+# SwiftPM doesn't track libtalk.a (linked with -L/-l), so a rebuilt core
+# would never reach the app: drop the old executable to force a relink
+rm -f "$BIN/TalkToMe"
+swift build -c release --package-path "$ROOT/macos" --arch arm64
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"

@@ -2,7 +2,10 @@
 
 Local text-to-speech for macOS on Apple Silicon. Agents, the browser, Finder
 and the command line send text to one queue, and it's read aloud with Kokoro
-running in-process on Metal through llama.cpp. Nothing leaves the machine.
+running in-process on Metal through llama.cpp. Speech never leaves the
+machine; the one exception is opt-in: Briefings can summarize agent replies
+with Codex, Claude Code, OpenCode or a remote Ollama, which sends those
+replies to that service (a local summary model keeps them on the Mac).
 
 Status: Phase 2 (menu bar app, Settings with Models and Voices). Phase 3
 (Services, hotkeys) is next. See [docs/PLAN.md](docs/PLAN.md).

@@ -62,7 +62,9 @@
     const host = document.createElement("div");
     host.id = HOST_ID;
     host.style.cssText = "all:initial;position:fixed;right:18px;bottom:18px;z-index:2147483647";
-    const shadow = host.attachShadow({ mode: "open" });
+    // closed, and only real clicks count: the page must not be able to press
+    // these buttons itself (start reading, interrupt playback)
+    const shadow = host.attachShadow({ mode: "closed" });
     adoptStyle(shadow, UI_CSS);
     shadow.innerHTML = [
       '<div class="root">',
@@ -94,12 +96,14 @@
 
     // keep the page selection when the button is pressed
     ui.fab.addEventListener("mousedown", (ev) => ev.preventDefault());
-    ui.fab.addEventListener("click", () => {
+    ui.fab.addEventListener("click", (ev) => {
+      if (!ev.isTrusted) return;
       const sel = window.getSelection();
       readScope(sel && sel.toString().trim() ? "selection" : "page");
     });
 
     shadow.addEventListener("click", (ev) => {
+      if (!ev.isTrusted) return;
       const act = ev.target.closest("[data-act]");
       if (!act) return;
       const name = act.dataset.act;

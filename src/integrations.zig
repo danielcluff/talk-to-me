@@ -243,11 +243,15 @@ pub fn mcp(ctx: *Ctx, rest: []const []const u8) !void {
             const tools = try std.json.parseFromSliceLeaky(std.json.Value, a, mcp_tools, .{});
             try writeRpc(w, a, id, .{ .tools = tools }, null);
         } else if (main.eql(method, "tools/call")) {
-            const text = callTool(&sub, app, params) catch |err| switch (err) {
-                error.Reported => "Talk to Me is not available (is the app running?)",
-                else => @errorName(err),
+            var failed = false;
+            const text = callTool(&sub, app, params) catch |err| blk: {
+                failed = true;
+                break :blk switch (err) {
+                    // the server's own message, e.g. "speed must be 0.25-4"
+                    error.Reported => if (sub.last_error.len > 0) sub.last_error else "Talk to Me is not available (is the app running?)",
+                    else => @errorName(err),
+                };
             };
-            const failed = std.mem.startsWith(u8, text, "Talk to Me is not") or std.mem.indexOfScalar(u8, text, ' ') == null;
             try writeRpc(w, a, id, .{
                 .content = &[_]struct { type: []const u8, text: []const u8 }{.{ .type = "text", .text = text }},
                 .isError = failed,
@@ -484,7 +488,9 @@ fn codexConfig(ctx: *Ctx) ![]const u8 {
 
 const Line = struct { start: usize, end: usize, text: []const u8 };
 
-/// The top-level `notify = [...]` line (before the first [table]), if any.
+/// The top-level `notify = [...]` setting (before the first [table]), if
+/// any. The array may span several lines; `end` is the end of the line that
+/// closes it.
 fn codexNotifyLine(data: []const u8) ?Line {
     var pos: usize = 0;
     while (pos < data.len) {
@@ -494,11 +500,62 @@ fn codexNotifyLine(data: []const u8) ?Line {
         if (std.mem.startsWith(u8, t, "[")) return null;
         if (std.mem.startsWith(u8, t, "notify") and std.mem.indexOfScalar(u8, t, '=') != null) {
             const rest = std.mem.trimStart(u8, t["notify".len..], " \t");
-            if (rest.len > 0 and rest[0] == '=') return .{ .start = pos, .end = end, .text = line };
+            if (rest.len > 0 and rest[0] == '=') {
+                const close = arrayEnd(data, pos) orelse return .{ .start = pos, .end = end, .text = line };
+                const close_end = std.mem.indexOfScalarPos(u8, data, close, '\n') orelse data.len;
+                return .{ .start = pos, .end = close_end, .text = data[pos..close_end] };
+            }
         }
         pos = end + 1;
     }
     return null;
+}
+
+/// Index of the ']' that closes the first '[' at or after `from`, skipping
+/// quoted strings and comments.
+fn arrayEnd(data: []const u8, from: usize) ?usize {
+    const open = std.mem.indexOfScalarPos(u8, data, from, '[') orelse return null;
+    var depth: usize = 0;
+    var i = open;
+    while (i < data.len) : (i += 1) {
+        switch (data[i]) {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if (depth == 0) return i;
+            },
+            '#' => i = std.mem.indexOfScalarPos(u8, data, i, '\n') orelse return null,
+            '"', '\'' => {
+                const q = data[i];
+                // TOML multi-line strings never appear in a notify array
+                i += 1;
+                while (i < data.len and data[i] != q) : (i += 1) {
+                    if (q == '"' and data[i] == '\\') i += 1;
+                }
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+test "codex notify spanning lines" {
+    const data =
+        \\model = "x"
+        \\notify = [
+        \\  "/bin/prog",  # the old one
+        \\  "turn-ended",
+        \\]
+        \\[tui]
+        \\x = 1
+    ;
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const l = codexNotifyLine(data).?;
+    try std.testing.expect(std.mem.endsWith(u8, l.text, "]"));
+    try std.testing.expectEqual(@as(usize, 2), (try tomlItems(arena.allocator(), l.text)).len);
+    // the rest of the file stays intact after the closing line
+    try std.testing.expect(std.mem.startsWith(u8, data[l.end..], "\n[tui]"));
 }
 
 /// The quoted items of a TOML string array, verbatim (with their quotes).
@@ -508,6 +565,11 @@ fn tomlItems(a: std.mem.Allocator, line: []const u8) ![]const []const u8 {
     var i = open + 1;
     while (i < line.len) : (i += 1) {
         const q = line[i];
+        if (q == '#') { // a comment, up to the end of its line
+            i = std.mem.indexOfScalarPos(u8, line, i, '\n') orelse line.len;
+            continue;
+        }
+        if (q == ']') break;
         if (q != '"' and q != '\'') continue;
         var j = i + 1;
         while (j < line.len and line[j] != q) : (j += 1) {

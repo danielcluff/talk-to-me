@@ -164,7 +164,8 @@ private struct VoiceList: Decodable { var model: String; var voices: [VoiceInfo]
 private struct JobList: Decodable { var jobs: [JobInfo] }
 private struct APIError: Decodable { var error: String }
 private struct CoreEvent: Decodable { var type: String; var state: String?; var index: Int? }
-private struct PairList: Decodable { var paired: [String] }
+private struct PendingPair: Decodable { var id: Int; var origin: String; var code: String }
+private struct PairList: Decodable { var paired: [String]; var pending: [PendingPair]? }
 
 // MARK: - Store
 
@@ -187,7 +188,10 @@ final class TalkCore: ObservableObject {
     var activeModel: ModelInfo? { models.first { $0.active && $0.kind == "voice" } }
     var isSpeaking: Bool { player.state == "playing" }
 
-    func start() {
+    /// Starts the core. Returns false if it could not start (startError says why);
+    /// every call then answers "not running" instead of touching a missing core.
+    @discardableResult
+    func start() -> Bool {
         let user = Unmanaged.passUnretained(self).toOpaque()
         let rc = talk_start(nil, { user, json in
             guard let user, let json else { return }
@@ -196,11 +200,11 @@ final class TalkCore: ObservableObject {
             DispatchQueue.main.async { core.handleEvent(data) }
         }, user)
         switch Int32(rc) {
-        case Int32(TALK_OK): break
+        case Int32(TALK_OK): return true
         case Int32(TALK_ERR_PORT): startError = "Another app holds the Talk to Me port. Quit it and relaunch."
         default: startError = "Talk to Me could not start (error \(rc))."
         }
-        Task { await refreshAll() }
+        return false
     }
 
     // MARK: calls
@@ -348,17 +352,27 @@ final class TalkCore: ObservableObject {
 
     @Published var pairedOrigins: [String] = []
 
-    /// A browser extension asked to connect: show its code so the person can
-    /// match it against the one in the extension, then approve or deny.
+    /// A browser extension asked to connect: show which one (its origin) and
+    /// its code, so the person can match both against the extension, then
+    /// approve or deny.
     private func askToPair(id: Int, code: String) {
-        NSApp.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.messageText = "Allow a browser extension to use Talk to Me?"
-        alert.informativeText = "The Talk to Me extension is asking to connect.\n\nCode: \(code)\n\nAllow it only if the extension shows the same code."
-        alert.addButton(withTitle: "Allow")
-        alert.addButton(withTitle: "Deny")
-        let allow = alert.runModal() == .alertFirstButtonReturn
         Task {
+            let origin = await get("/v1/pair", as: PairList.self)?.pending?.first { $0.id == id }?.origin
+            guard let origin else { return } // expired or already answered
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.messageText = "Allow a browser extension to use Talk to Me?"
+            alert.informativeText = """
+                An extension is asking to read pages aloud and control playback.
+
+                Extension: \(origin)
+                Code: \(code)
+
+                Allow it only if you just clicked Connect in the Talk to Me extension and it shows the same code. Extension IDs are listed on your browser's Extensions page.
+                """
+            alert.addButton(withTitle: "Deny")
+            alert.addButton(withTitle: "Allow")
+            let allow = alert.runModal() == .alertSecondButtonReturn
             await send("POST", "/v1/pair/\(id)/\(allow ? "approve" : "deny")")
             await refreshPaired()
         }

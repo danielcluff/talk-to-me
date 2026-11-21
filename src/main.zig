@@ -75,6 +75,8 @@ pub const Ctx = struct {
     environ: *std.process.Environ.Map,
     port: u16,
     token: []const u8 = "",
+    /// the message of the last fail(), for callers that report it elsewhere (MCP)
+    last_error: []const u8 = "",
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -160,6 +162,7 @@ pub fn outf(ctx: *Ctx, comptime fmt: []const u8, args: anytype) !void {
 
 pub fn fail(ctx: *Ctx, comptime fmt: []const u8, args: anytype) error{Reported} {
     const msg = std.fmt.allocPrint(ctx.arena, "talktome: " ++ fmt ++ "\n", args) catch "talktome: error\n";
+    ctx.last_error = std.mem.trimEnd(u8, msg["talktome: ".len..], "\n");
     Io.File.stderr().writeStreamingAll(ctx.io, msg) catch {};
     return error.Reported;
 }
@@ -193,6 +196,8 @@ pub fn rawRequest(ctx: *Ctx, method: std.http.Method, path: []const u8, payload:
     var body: Io.Writer.Allocating = .init(ctx.arena);
     const url = try std.fmt.allocPrint(ctx.arena, "http://127.0.0.1:{d}{s}", .{ ctx.port, path });
     const auth = try std.fmt.allocPrint(ctx.arena, "Bearer {s}", .{ctx.token});
+    // the health check is public: it never needs the token
+    const send_auth = !std.mem.startsWith(u8, path, "/v1/health");
     // std.http.Client declares a chunked body on a bodiless POST and never
     // sends it, so the server would wait; always send at least "{}".
     const body_payload: ?[]const u8 = payload orelse if (method.requestHasBody()) @as([]const u8, "{}") else null;
@@ -203,7 +208,7 @@ pub fn rawRequest(ctx: *Ctx, method: std.http.Method, path: []const u8, payload:
         .keep_alive = false,
         .response_writer = &body.writer,
         .headers = .{ .content_type = if (body_payload != null) .{ .override = "application/json" } else .default },
-        .extra_headers = &.{.{ .name = "authorization", .value = auth }},
+        .extra_headers = if (send_auth) &.{.{ .name = "authorization", .value = auth }} else &.{},
     });
     return .{ .status = res.status, .body = body.written() };
 }
@@ -225,9 +230,14 @@ fn errorMessage(a: std.mem.Allocator, body: []const u8) ?[]const u8 {
     return e.@"error";
 }
 
+/// A Talk to Me server is up and holds our token. Checked without sending
+/// the token (see server.verifyServer): another user could hold the port.
 fn healthy(ctx: *Ctx) bool {
-    const res = rawRequest(ctx, .GET, "/v1/health", null) catch return false;
-    return res.status == .ok;
+    if (ctx.token.len == 0) {
+        // created by the first server start
+        ctx.token = config.readToken(ctx.arena, ctx.io, ctx.paths) catch return false;
+    }
+    return server.verifyServer(ctx.gpa, ctx.io, ctx.port, ctx.token);
 }
 
 /// Launch the menu bar app in the background if it is installed
@@ -247,12 +257,19 @@ fn openApp(ctx: *Ctx) bool {
 /// Make sure a server is running (start one in the background if not) and
 /// load the token.
 pub fn ensureServer(ctx: *Ctx) !void {
-    if (!healthy(ctx) and openApp(ctx)) {
+    var ok = healthy(ctx);
+    if (!ok and openApp(ctx)) {
         // the app hosts the server; give it a moment to come up
         var waited: u32 = 0;
-        while (!healthy(ctx) and waited < 10_000) : (waited += 100) try ctx.io.sleep(.fromMilliseconds(100), .awake);
+        while (waited < 10_000) : (waited += 100) {
+            ok = healthy(ctx);
+            if (ok) break;
+            try ctx.io.sleep(.fromMilliseconds(100), .awake);
+        }
     }
-    if (!healthy(ctx)) {
+    if (!ok and server.portInUse(ctx.io, ctx.port))
+        return fail(ctx, "port {d} is held by something that isn't this Talk to Me (or the token file changed); not sending the token", .{ctx.port});
+    if (!ok) {
         const exe = try std.process.executablePathAlloc(ctx.io, ctx.arena);
         try Io.Dir.cwd().createDirPath(ctx.io, ctx.paths.logs);
         const log_path = try std.fs.path.join(ctx.arena, &.{ ctx.paths.logs, "server.log" });
@@ -269,8 +286,7 @@ pub fn ensureServer(ctx: *Ctx) !void {
             try ctx.io.sleep(.fromMilliseconds(100), .awake);
         }
     }
-    ctx.token = config.readToken(ctx.arena, ctx.io, ctx.paths) catch |err|
-        return fail(ctx, "cannot read the API token ({t}) at {s}", .{ err, ctx.paths.token });
+    if (ctx.token.len == 0) return fail(ctx, "cannot read the API token at {s}", .{ctx.paths.token});
 }
 
 // ------------------------------------------------------------------ speak
@@ -379,19 +395,25 @@ fn speak(ctx: *Ctx, args: []const []const u8) !void {
 }
 
 fn waitForJob(ctx: *Ctx, id: []const u8) !void {
-    const J = struct { id: u64, state: []const u8 };
-    const L = struct { jobs: []J };
+    const D = struct { job: struct { state: []const u8 } };
     const want = server.parseJobId(id) orelse return;
+    const path = try std.fmt.allocPrint(ctx.arena, "/v1/jobs/{d}", .{want});
+    var unreadable: u32 = 0;
     while (true) {
         try ctx.io.sleep(.fromMilliseconds(300), .awake);
-        const body = try request(ctx, .GET, "/v1/jobs", null);
-        const list = std.json.parseFromSliceLeaky(L, ctx.arena, body, .{ .ignore_unknown_fields = true }) catch continue;
-        for (list.jobs) |j| if (j.id == want) {
-            if (!eql(j.state, "queued") and !eql(j.state, "playing")) {
-                if (!eql(j.state, "done")) try outf(ctx, "{s}: {s}\n", .{ id, j.state });
-                return;
-            }
+        const res = rawRequest(ctx, .GET, path, null) catch return fail(ctx, "lost the server while waiting for {s}", .{id});
+        // gone from the queue and the history (e.g. History was cleared): it ended
+        if (res.status == .not_found) return;
+        if (@intFromEnum(res.status) >= 300) return fail(ctx, "{s}", .{errorMessage(ctx.arena, res.body) orelse res.body});
+        const d = std.json.parseFromSliceLeaky(D, ctx.arena, res.body, .{ .ignore_unknown_fields = true }) catch {
+            unreadable += 1;
+            if (unreadable > 20) return fail(ctx, "unexpected response: {s}", .{res.body});
+            continue;
         };
+        if (!eql(d.job.state, "queued") and !eql(d.job.state, "playing")) {
+            if (!eql(d.job.state, "done")) try outf(ctx, "{s}: {s}\n", .{ id, d.job.state });
+            return;
+        }
     }
 }
 

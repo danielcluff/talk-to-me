@@ -944,8 +944,9 @@ struct AboutPage: View {
         PageHeader(title: "Talk to Me", subtitle: "Local text-to-speech for your apps and agents.")
         Card {
             Text("Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "dev")")
-            Text("Speech runs on this Mac with llama.cpp and Metal. Text never leaves the machine.")
+            Text("Speech runs on this Mac with llama.cpp and Metal, and listening uses on-device recognition. Text stays on this Mac, with one exception: when Briefings are on and use Codex, Claude Code, OpenCode or an Ollama server on another machine, agent replies are sent to that service to be summarized. A local summary model keeps everything here.")
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
             Text("Models: Kokoro-82M (Apache 2.0), tiny-voca. Markdown: md4c (MIT).")
                 .font(.callout).foregroundStyle(.secondary)
         }

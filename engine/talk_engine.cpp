@@ -17,6 +17,8 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <memory>
+#include <mutex>
 #include <string>
 
 namespace {
@@ -114,19 +116,24 @@ te_synth_params te_synth_params_default(void) {
     return p;
 }
 
+// The voice, summary and listening models load on different threads (engine,
+// briefing, recognizer); the backend is set up once for all of them.
+static void init_backend() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        llama_log_set(log_cb, nullptr);
+        mtmd_helper_log_set(log_cb, nullptr);
+        llama_backend_init();
+    });
+}
+
 te_engine * te_load(const te_load_params * lp, char * err, size_t err_size) {
     if (!lp || !lp->model_path || !lp->mmproj_path) {
         set_err(err, err_size, "model_path and mmproj_path are required");
         return nullptr;
     }
 
-    static bool backend_ready = false;
-    if (!backend_ready) {
-        llama_log_set(log_cb, nullptr);
-        mtmd_helper_log_set(log_cb, nullptr);
-        llama_backend_init();
-        backend_ready = true;
-    }
+    init_backend();
 
     auto * e = new te_engine();
     try {
@@ -344,12 +351,7 @@ te_llm * te_llm_load(const char * model_path, int32_t use_gpu, char * err, size_
         set_err(err, err_size, "model_path is required");
         return nullptr;
     }
-    static bool backend_ready = false;
-    if (!backend_ready) {
-        llama_log_set(log_cb, nullptr);
-        llama_backend_init();
-        backend_ready = true;
-    }
+    init_backend();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = use_gpu ? 999 : 0;
     llama_model * model = llama_model_load_from_file(model_path, mp);
@@ -416,19 +418,24 @@ int32_t te_llm_generate(te_llm * llm, const char * user_message, int32_t max_tok
         cp.n_ctx = (uint32_t) (tokens.size() + n_max + 16);
         cp.n_batch = (uint32_t) tokens.size();
         cp.no_perf = true;
-        llama_context * ctx = llama_init_from_model(llm->model, cp);
+        // owned, so an exception below (tokenizing a piece, appending) frees them
+        std::unique_ptr<llama_context, decltype(&llama_free)> ctx_owner(llama_init_from_model(llm->model, cp), &llama_free);
+        llama_context * ctx = ctx_owner.get();
         if (!ctx) {
             set_err(err, err_size, "failed to create a context");
             return -1;
         }
 
-        llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
+        std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> smpl_owner(
+            llama_sampler_chain_init(llama_sampler_chain_default_params()), &llama_sampler_free);
+        llama_sampler * smpl = smpl_owner.get();
         llama_sampler_chain_add(smpl, llama_sampler_init_top_k(40));
         llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.9f, 1));
         llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.3f));
         llama_sampler_chain_add(smpl, llama_sampler_init_dist(42));
 
-        llama_batch_ext * batch = llama_batch_ext_init(ctx);
+        std::unique_ptr<llama_batch_ext, decltype(&llama_batch_ext_free)> batch_owner(llama_batch_ext_init(ctx), &llama_batch_ext_free);
+        llama_batch_ext * batch = batch_owner.get();
         llm_batch(batch, tokens.data(), (int32_t) tokens.size(), 0);
         llama_pos pos = (llama_pos) tokens.size();
         std::string reply;
@@ -444,9 +451,6 @@ int32_t te_llm_generate(te_llm * llm, const char * user_message, int32_t max_tok
             reply += common_token_to_piece(llm->vocab, t, false);
             llm_batch(batch, &t, 1, pos++);
         }
-        llama_batch_ext_free(batch);
-        llama_sampler_free(smpl);
-        llama_free(ctx);
         if (rc != 0) return rc;
 
         const size_t n = std::min(reply.size(), out_size - 1);
@@ -473,13 +477,7 @@ te_asr * te_asr_load(const char * model_path, const char * mmproj_path, int32_t 
         set_err(err, err_size, "model_path and mmproj_path are required");
         return nullptr;
     }
-    static bool backend_ready = false;
-    if (!backend_ready) {
-        llama_log_set(log_cb, nullptr);
-        mtmd_helper_log_set(log_cb, nullptr);
-        llama_backend_init();
-        backend_ready = true;
-    }
+    init_backend();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = use_gpu ? 999 : 0;
     llama_model * model = llama_model_load_from_file(model_path, mp);

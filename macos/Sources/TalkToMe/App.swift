@@ -1,4 +1,5 @@
 import AppKit
+import CTalk
 import KeyboardShortcuts
 import SwiftUI
 import UniformTypeIdentifiers
@@ -53,13 +54,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in
             Hotkeys.install()
             let core = TalkCore.shared
-            core.start()
+            guard core.start() else { return } // the menu shows startError
             await core.refreshAll()
             // first run: no model yet → open Settings on the Models page
             if !core.hasInstalledModel {
                 SettingsWindow.shared.show(.models)
             }
         }
+    }
+
+    /// Save history, then leave without running C++ static destructors:
+    /// ggml's Metal device teardown aborts inside exit().
+    func applicationWillTerminate(_ notification: Notification) {
+        talk_prepare_exit()
+        _exit(0)
     }
 
     /// Open With → Talk to Me, or files dropped on the app.

@@ -12,7 +12,10 @@ const log = std.log.scoped(.libtalk);
 
 const gpa = std.heap.c_allocator;
 
+/// talk_start was called (it may be called once)
 var started = std.atomic.Value(bool).init(false);
+/// the core and the server are set up; until then calls answer 503
+var ready = std.atomic.Value(bool).init(false);
 var threaded: Io.Threaded = undefined;
 var arena_state: std.heap.ArenaAllocator = .init(std.heap.c_allocator);
 var srv: server.Server = undefined;
@@ -60,10 +63,16 @@ export fn talk_start(home_c: ?[*:0]const u8, cb: ?*const fn (?*anyopaque, [*:0]c
         const et = std.Thread.spawn(.{}, eventLoop, .{core}) catch return TALK_ERR_INTERNAL;
         et.detach();
     }
+    ready.store(true, .release);
     return TALK_OK;
 }
 
 fn askToShutdown(io: Io, port: u16, token: []const u8) void {
+    // only a server that proves it holds our token gets the token
+    if (!server.verifyServer(gpa, io, port, token)) {
+        log.warn("port {d} is held by something that isn't Talk to Me", .{port});
+        return;
+    }
     var client: http.Client = .{ .allocator = gpa, .io = io };
     defer client.deinit();
     var url_buf: [64]u8 = undefined;
@@ -102,12 +111,13 @@ export fn talk_call(method_c: [*:0]const u8, path_c: [*:0]const u8, body_c: ?[*:
     const a = arena.allocator();
     var ex: server.Exchange = .{ .body = if (body_c) |b| std.mem.span(b) else "" };
 
-    if (!started.load(.acquire)) {
+    if (!ready.load(.acquire)) {
         ex.status = .service_unavailable;
-        ex.reply = "{\"error\":\"talk_start has not been called\"}";
+        ex.reply = "{\"error\":\"Talk to Me is not running\"}";
     } else if (std.meta.stringToEnum(http.Method, std.mem.span(method_c))) |method| {
         const full = std.mem.span(path_c);
         const path = if (std.mem.indexOfScalar(u8, full, '?')) |q| full[0..q] else full;
+        if (std.mem.indexOfScalar(u8, full, '?')) |q| ex.query = full[q + 1 ..];
         server.dispatch(&srv, &ex, a, method, path) catch |err| {
             ex.status = .internal_server_error;
             ex.reply = std.fmt.allocPrint(a, "{{\"error\":\"{t}\"}}", .{err}) catch "{\"error\":\"internal\"}";
@@ -125,6 +135,11 @@ export fn talk_free(p: ?[*:0]u8) void {
     if (p) |ptr| std.heap.c_allocator.free(std.mem.span(ptr));
 }
 
+export fn talk_prepare_exit() void {
+    if (!ready.load(.acquire)) return;
+    srv.core.flushHistory();
+}
+
 /// The app recorded an answer to "Want the full report?": transcribe it with
 /// the local recognizer, act on it, and return {"transcript": ..., "answer":
 /// "yes"|"no"|null} (free with talk_free), or an {"error": ...}.
@@ -133,7 +148,7 @@ export fn talk_answer_audio(pcm: [*]const f32, n_samples: usize, sample_rate: i3
     defer arena.deinit();
     const a = arena.allocator();
     const reply: []const u8 = blk: {
-        if (!started.load(.acquire)) break :blk "{\"error\":\"talk_start has not been called\"}";
+        if (!ready.load(.acquire)) break :blk "{\"error\":\"Talk to Me is not running\"}";
         const heard = srv.core.answerFromAudio(a, pcm[0..n_samples], @intCast(sample_rate)) catch |err|
             break :blk std.fmt.allocPrint(a, "{{\"error\":\"{t}\"}}", .{err}) catch "{\"error\":\"internal\"}";
         break :blk std.json.Stringify.valueAlloc(a, .{

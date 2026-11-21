@@ -212,6 +212,27 @@ function onCoreEvent(e) {
   }
 }
 
+/// The event stream just (re)connected: anything that happened before it
+/// (a short read can start and finish in that gap) was missed, so ask the
+/// player where things stand.
+async function reconcile() {
+  if (!state.jobId) return;
+  const res = await api("GET", "/v1/player");
+  if (!res.ok || !state.jobId) return;
+  const p = res.json;
+  if (p.job != null && "j_" + p.job === state.jobId) {
+    state.status = p.state === "paused" ? "paused" : "playing";
+    state.index = p.index;
+    broadcast();
+    saveState();
+    toTab(state.tabId, { t: "highlight", index: p.index });
+    chrome.action.setBadgeText({ text: (p.index + 1) + "/" + state.total });
+  } else if (!p.queued) {
+    // not playing and nothing waiting: ours already finished
+    setIdle();
+  }
+}
+
 // ---------- reading ----------
 
 async function startReading(opts) {
@@ -293,6 +314,7 @@ chrome.runtime.onMessage.addListener((msg, sender, respond) => {
   if (!msg) return false;
   if (msg.from === "offscreen") {
     if (msg.t === "event") onCoreEvent(msg.event);
+    if (msg.t === "connected") reconcile();
     if (msg.t === "ready") openEvents();
     return false;
   }

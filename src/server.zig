@@ -2,9 +2,14 @@
 //!
 //! Security: bound to loopback only; the Host header must name the loopback
 //! address and port (DNS rebinding); every route except /v1/health needs
-//! `Authorization: Bearer <token>`; requests carrying an Origin header are
-//! rejected until the browser extension pairing exists (Phase 5), so web
-//! pages cannot drive the API.
+//! `Authorization: Bearer <token>`. The app and the CLI use the master token.
+//! A paired browser extension gets a token of its own, which works only from
+//! its own Origin and only for reading aloud and the player (see
+//! extensionAllowed); "Forget" revokes it. Web pages never get in.
+//!
+//! Clients check the server before sending the master token: GET
+//! /v1/health?challenge=X answers with HMAC-SHA256(token, X), which only the
+//! real server can compute (another user could otherwise hold the port).
 
 const std = @import("std");
 const Io = std.Io;
@@ -12,6 +17,7 @@ const http = std.http;
 const core_mod = @import("core.zig");
 const Core = core_mod.Core;
 const config = @import("config.zig");
+const briefing_mod = @import("briefing.zig");
 
 const log = std.log.scoped(.server);
 pub const version = "0.1.0";
@@ -27,9 +33,186 @@ pub const Server = struct {
     /// the port; the app's in-process server ignores it.
     allow_shutdown: bool = false,
     pairing: Pairing = .{},
-    /// sample rate of the current /v1/briefing/answer-audio request (from ?rate=)
-    answer_audio_rate: u32 = 16000,
+    extensions: Extensions = .{},
+    /// open connections (each has a thread); see max_connections
+    connections: std.atomic.Value(u32) = .init(0),
 };
+
+/// Above this many open connections new ones are closed at once, before a
+/// thread is made for them. Clients are the app, hooks, the CLI and an
+/// extension's event stream, so this is far above normal use.
+pub const max_connections = 64;
+
+/// Tokens of paired extensions, stored as SHA-256 hashes in extensions.json
+/// (mode 0600). One per origin.
+const Extensions = struct {
+    mu: Io.Mutex = .init,
+    loaded: bool = false,
+    items: std.ArrayList(Entry) = .empty,
+
+    const Entry = struct { origin: []const u8, token_sha256: []const u8 };
+};
+
+fn sha256Hex(token: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(token, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+fn extensionsPath(s: *Server, a: std.mem.Allocator) ![]const u8 {
+    return std.fs.path.join(a, &.{ s.paths.root, "extensions.json" });
+}
+
+/// Caller holds extensions.mu.
+fn loadExtensions(s: *Server) void {
+    if (s.extensions.loaded) return;
+    s.extensions.loaded = true;
+    var arena: std.heap.ArenaAllocator = .init(s.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = extensionsPath(s, a) catch return;
+    const data = Io.Dir.cwd().readFileAlloc(s.io, path, a, .limited(1 << 20)) catch return;
+    const list = std.json.parseFromSliceLeaky([]Extensions.Entry, a, data, .{ .ignore_unknown_fields = true }) catch return;
+    for (list) |e| {
+        const origin = s.gpa.dupe(u8, e.origin) catch return;
+        const hash = s.gpa.dupe(u8, e.token_sha256) catch return;
+        s.extensions.items.append(s.gpa, .{ .origin = origin, .token_sha256 = hash }) catch return;
+    }
+}
+
+/// Caller holds extensions.mu.
+fn saveExtensions(s: *Server) !void {
+    var arena: std.heap.ArenaAllocator = .init(s.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = try extensionsPath(s, a);
+    try Io.Dir.cwd().createDirPath(s.io, s.paths.root);
+    const json = try std.json.Stringify.valueAlloc(a, s.extensions.items.items, .{ .whitespace = .indent_2 });
+    const tmp = try std.fmt.allocPrint(a, "{s}.tmp", .{path});
+    const file = try Io.Dir.cwd().createFile(s.io, tmp, .{ .permissions = .fromMode(0o600), .truncate = true });
+    {
+        defer file.close(s.io);
+        try file.writeStreamingAll(s.io, json);
+    }
+    try Io.Dir.rename(.cwd(), tmp, .cwd(), path, s.io);
+}
+
+/// The origin whose extension token this is, if any.
+fn extensionForToken(s: *Server, a: std.mem.Allocator, auth: []const u8) ?[]const u8 {
+    const prefix = "Bearer ";
+    if (!std.mem.startsWith(u8, auth, prefix)) return null;
+    const hash = sha256Hex(auth[prefix.len..]);
+    s.extensions.mu.lockUncancelable(s.io);
+    defer s.extensions.mu.unlock(s.io);
+    loadExtensions(s);
+    for (s.extensions.items.items) |e| {
+        if (constantTimeEql(e.token_sha256, &hash)) return a.dupe(u8, e.origin) catch null;
+    }
+    return null;
+}
+
+/// A new random extension token (hex).
+fn issueExtensionToken(s: *Server) ![64]u8 {
+    var raw: [32]u8 = undefined;
+    try s.io.randomSecure(&raw);
+    return std.fmt.bytesToHex(raw, .lower);
+}
+
+fn storeExtensionToken(s: *Server, origin: []const u8, token: []const u8) !void {
+    const hash = sha256Hex(token);
+    s.extensions.mu.lockUncancelable(s.io);
+    defer s.extensions.mu.unlock(s.io);
+    loadExtensions(s);
+    removeExtensionLocked(s, origin);
+    try s.extensions.items.append(s.gpa, .{ .origin = try s.gpa.dupe(u8, origin), .token_sha256 = try s.gpa.dupe(u8, &hash) });
+    try saveExtensions(s);
+}
+
+fn removeExtensionLocked(s: *Server, origin: []const u8) void {
+    var i: usize = 0;
+    while (i < s.extensions.items.items.len) {
+        const e = s.extensions.items.items[i];
+        if (std.mem.eql(u8, e.origin, origin)) {
+            s.gpa.free(e.origin);
+            s.gpa.free(e.token_sha256);
+            _ = s.extensions.items.orderedRemove(i);
+        } else i += 1;
+    }
+}
+
+fn revokeExtension(s: *Server, origin: []const u8) !void {
+    s.extensions.mu.lockUncancelable(s.io);
+    defer s.extensions.mu.unlock(s.io);
+    loadExtensions(s);
+    removeExtensionLocked(s, origin);
+    try saveExtensions(s);
+}
+
+/// What a paired extension may do: read aloud, drive the player, follow events.
+pub fn extensionAllowed(method: http.Method, path: []const u8) bool {
+    if (method == .GET) {
+        return std.mem.eql(u8, path, "/v1/health") or std.mem.eql(u8, path, "/v1/player") or
+            std.mem.eql(u8, path, "/v1/events") or std.mem.eql(u8, path, "/v1/voices");
+    }
+    if (method == .POST) {
+        return std.mem.eql(u8, path, "/v1/speak") or std.mem.startsWith(u8, path, "/v1/player/");
+    }
+    return false;
+}
+
+fn constantTimeEql(x: []const u8, y: []const u8) bool {
+    if (x.len != y.len) return false;
+    var diff: u8 = 0;
+    for (x, y) |p, q| diff |= p ^ q;
+    return diff == 0;
+}
+
+/// Value of `name` in a query string ("a=1&b=2"), undecoded.
+pub fn queryParam(query: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
+    }
+    return null;
+}
+
+/// HMAC-SHA256(token, "talktome-health:" ++ challenge), hex.
+pub fn healthProof(token: []const u8, challenge: []const u8) [64]u8 {
+    const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [Hmac.mac_length]u8 = undefined;
+    var h = Hmac.init(token);
+    h.update("talktome-health:");
+    h.update(challenge);
+    h.final(&mac);
+    return std.fmt.bytesToHex(mac, .lower);
+}
+
+/// True if the server on `port` proves it holds `token` (without sending it).
+pub fn verifyServer(gpa: std.mem.Allocator, io: Io, port: u16, token: []const u8) bool {
+    if (token.len == 0) return false;
+    var raw: [16]u8 = undefined;
+    io.random(&raw);
+    const challenge = std.fmt.bytesToHex(raw, .lower);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var client: http.Client = .{ .allocator = gpa, .io = io };
+    defer client.deinit();
+    var body: Io.Writer.Allocating = .init(a);
+    const url = std.fmt.allocPrint(a, "http://127.0.0.1:{d}/v1/health?challenge={s}", .{ port, &challenge }) catch return false;
+    const res = client.fetch(.{
+        .location = .{ .url = url },
+        .method = .GET,
+        .keep_alive = false,
+        .response_writer = &body.writer,
+    }) catch return false;
+    if (res.status != .ok) return false;
+    const R = struct { proof: []const u8 = "" };
+    const r = std.json.parseFromSliceLeaky(R, a, body.written(), .{ .ignore_unknown_fields = true }) catch return false;
+    const want = healthProof(token, &challenge);
+    return constantTimeEql(r.proof, &want);
+}
 
 /// Browser extension pairing. An extension asks (POST /v1/pair, from an
 /// extension Origin only); the app or CLI approves it; the extension then
@@ -38,12 +221,21 @@ const Pairing = struct {
     mu: Io.Mutex = .init,
     next_id: u32 = 1,
     items: [8]?Pair = @splat(null),
+    /// origins recently denied, which may not ask again for a while
+    denied: [8]struct { origin_hash: u64 = 0, until_ms: i64 = 0 } = @splat(.{}),
+
+    /// an unanswered request expires; one at a time may wait for an answer
+    const pending_ms = 120_000;
+    const denied_cooldown_ms = 60_000;
 
     const Pair = struct {
         id: u32,
         origin: [160]u8 = @splat(0),
         secret: [32]u8,
         code: [4]u8,
+        created_ms: i64 = 0,
+        /// the extension's own token, handed out once after approval
+        token: [64]u8 = @splat(0),
         status: enum { pending, approved, denied } = .pending,
 
         fn originStr(p: *const Pair) []const u8 {
@@ -94,8 +286,17 @@ pub fn serveOn(s: *Server, listener: *Io.net.Server) void {
             log.err("accept failed: {t}", .{err});
             continue;
         };
-        const t = std.Thread.spawn(.{}, connection, .{ s, stream }) catch |err| {
+        if (s.connections.fetchAdd(1, .acq_rel) >= max_connections) {
+            _ = s.connections.fetchSub(1, .acq_rel);
+            log.warn("too many connections; closing a new one", .{});
+            stream.close(s.io);
+            continue;
+        }
+        // 2 MB, not the 16 MB default: requests use heap arenas (markdown
+        // parsing included), so 64 connections stay cheap
+        const t = std.Thread.spawn(.{ .stack_size = 2 << 20 }, connection, .{ s, stream }) catch |err| {
             log.err("thread spawn failed: {t}", .{err});
+            _ = s.connections.fetchSub(1, .acq_rel);
             stream.close(s.io);
             continue;
         };
@@ -104,6 +305,7 @@ pub fn serveOn(s: *Server, listener: *Io.net.Server) void {
 }
 
 fn connection(s: *Server, stream: Io.net.Stream) void {
+    defer _ = s.connections.fetchSub(1, .acq_rel);
     defer stream.close(s.io);
     var recv_buf: [8192]u8 = undefined;
     var send_buf: [8192]u8 = undefined;
@@ -153,17 +355,19 @@ fn hostAllowed(s: *Server, host: []const u8) bool {
 fn tokenOk(s: *Server, auth: []const u8) bool {
     const prefix = "Bearer ";
     if (!std.mem.startsWith(u8, auth, prefix)) return false;
-    const given = auth[prefix.len..];
-    if (given.len != s.token.len) return false;
-    var diff: u8 = 0;
-    for (given, s.token) |x, y| diff |= x ^ y;
-    return diff == 0;
+    return constantTimeEql(auth[prefix.len..], s.token);
+}
+
+fn nowMs(io: Io) i64 {
+    return @intCast(@divTrunc(Io.Timestamp.now(io, .awake).toNanoseconds(), std.time.ns_per_ms));
 }
 
 /// One API call, transport-independent: the request body in, status and JSON
 /// out. The HTTP server and the in-process C interface (lib.zig) both use it.
 pub const Exchange = struct {
     body: []const u8 = "",
+    /// the query string, without '?'
+    query: []const u8 = "",
     status: http.Status = .ok,
     reply: []const u8 = "{}",
 
@@ -210,32 +414,34 @@ fn handle(s: *Server, req: *http.Server.Request, a: std.mem.Allocator) !void {
         return pairStatus(s, req, a, path["/v1/pair/".len..], target);
     }
 
-    // web pages never get in; a paired extension does, with the token
+    const public = method == .GET and std.mem.eql(u8, path, "/v1/health");
+    // web pages never get in; a paired extension does, with its own token
     if (head.origin) |origin| {
         if (!isExtensionOrigin(origin) or !originPaired(s, a, origin)) {
             return respondError(req, a, .forbidden, "this origin is not paired with Talk to Me");
         }
-        // approving a pairing is for the app and the CLI only
-        if (std.mem.startsWith(u8, path, "/v1/pair")) return respondError(req, a, .forbidden, "not allowed from a browser");
     }
-    const public = method == .GET and std.mem.eql(u8, path, "/v1/health");
-    if (!public and !tokenOk(s, head.auth)) return respondError(req, a, .unauthorized, "missing or bad token");
+    if (!public) {
+        if (head.origin == null and tokenOk(s, head.auth)) {
+            // the app or the CLI: everything
+        } else if (extensionForToken(s, a, head.auth)) |ext_origin| {
+            // an extension token works only from its own origin (or with no
+            // Origin header at all), and only for its routes
+            if (head.origin) |o| if (!std.mem.eql(u8, o, ext_origin)) return respondError(req, a, .forbidden, "this token belongs to another extension");
+            if (!originPaired(s, a, ext_origin)) return respondError(req, a, .unauthorized, "this extension was unpaired");
+            if (!extensionAllowed(method, path)) return respondError(req, a, .forbidden, "not allowed for a browser extension");
+        } else {
+            return respondError(req, a, .unauthorized, "missing or bad token");
+        }
+    }
     if (method == .GET and std.mem.eql(u8, path, "/v1/events")) return events(s, req, a);
 
-    var ex: Exchange = .{};
+    var ex: Exchange = .{ .query = if (std.mem.indexOfScalar(u8, target, '?')) |q| target[q + 1 ..] else "" };
     // only read a body the request declares (Content-Length or chunked); a
     // bare POST like /v1/player/stop would otherwise wait for EOF forever
     const declared = req.head.content_length != null or req.head.transfer_encoding == .chunked;
     if (method.requestHasBody() and declared) {
         ex.body = readBody(req, a, 4 << 20) catch return respondError(req, a, .payload_too_large, "body too large");
-    }
-    if (std.mem.endsWith(u8, path, "/answer-audio")) {
-        s.answer_audio_rate = 16000;
-        if (std.mem.indexOf(u8, target, "rate=")) |i| {
-            var v = target[i + 5 ..];
-            if (std.mem.indexOfScalar(u8, v, '&')) |amp| v = v[0..amp];
-            s.answer_audio_rate = std.fmt.parseInt(u32, v, 10) catch 16000;
-        }
     }
     try dispatch(s, &ex, a, method, path);
     try req.respond(ex.reply, .{
@@ -250,7 +456,12 @@ pub fn dispatch(s: *Server, ex: *Exchange, a: std.mem.Allocator, method: http.Me
     const req = ex;
     if (method == .GET and std.mem.eql(u8, path, "/v1/health")) {
         const p = try s.core.playerSnapshot(a);
-        return sendJson(req, a, .ok, .{ .ok = true, .version = version, .model = p.model, .model_state = p.model_state, .queued = p.queued, .state = p.state });
+        // proof that this server holds the token (see verifyServer)
+        const proof: ?[]const u8 = if (queryParam(req.query, "challenge")) |ch|
+            (if (ch.len > 0 and ch.len <= 128) try a.dupe(u8, &healthProof(s.token, ch)) else null)
+        else
+            null;
+        return sendJson(req, a, .ok, .{ .ok = true, .version = version, .model = p.model, .model_state = p.model_state, .queued = p.queued, .state = p.state, .proof = proof });
     }
     if (method == .POST and std.mem.eql(u8, path, "/v1/shutdown")) {
         if (!s.allow_shutdown) return sendError(req, a, .forbidden, "this server is hosted by the app");
@@ -319,7 +530,9 @@ fn briefingRoute(s: *Server, req: *Exchange, a: std.mem.Allocator, method: http.
     }
     if (std.mem.eql(u8, action, "answer-audio")) {
         // body: little-endian float32 mono samples; ?rate=16000
-        const rate = s.answer_audio_rate;
+        const rate_text = queryParam(req.query, "rate") orelse "16000";
+        const rate = std.fmt.parseInt(u32, rate_text, 10) catch return sendError(req, a, .bad_request, "rate must be a number");
+        if (rate < 8000 or rate > 192_000) return sendError(req, a, .bad_request, "rate must be 8000-192000");
         if (req.body.len < 4 or req.body.len % 4 != 0) return sendError(req, a, .bad_request, "body must be float32 samples");
         const samples = try a.alloc(f32, req.body.len / 4);
         for (samples, 0..) |*o, i| o.* = @bitCast(std.mem.readInt(u32, req.body[i * 4 ..][0..4], .little));
@@ -493,7 +706,8 @@ fn modelRoute(s: *Server, req: *Exchange, a: std.mem.Allocator, method: http.Met
         return sendJson(req, a, .ok, .{ .ok = true });
     }
     if (method == .POST and std.mem.eql(u8, action, "activate")) {
-        var settings = try s.core.getSettings(a);
+        var settings = try s.core.beginEdit(a);
+        defer s.core.endEdit();
         switch (m.kind) {
             .summary => {
                 settings.briefing.backend = .local;
@@ -515,7 +729,9 @@ fn modelRoute(s: *Server, req: *Exchange, a: std.mem.Allocator, method: http.Met
     }
     if (method == .DELETE and action.len == 0) {
         // deleting what's in use switches to something safe first
-        var settings = try s.core.getSettings(a);
+        var settings = try s.core.beginEdit(a);
+        var edit_open = true;
+        defer if (edit_open) s.core.endEdit();
         var changed = false;
         switch (m.kind) {
             .voice => if (std.mem.eql(u8, settings.model, m.id)) {
@@ -539,6 +755,8 @@ fn modelRoute(s: *Server, req: *Exchange, a: std.mem.Allocator, method: http.Met
             },
         }
         if (changed) s.core.setSettings(settings) catch {};
+        s.core.endEdit();
+        edit_open = false;
         @import("models/models.zig").remove(s.gpa, s.io, s.paths.models, m.*) catch |err|
             return sendError(req, a, .internal_server_error, @errorName(err));
         s.core.resetLoadFailure();
@@ -587,7 +805,8 @@ fn patchSettings(s: *Server, req: *Exchange, a: std.mem.Allocator) !void {
     const body = req.bodyLimited(64 << 10) catch return sendError(req, a, .payload_too_large, "body too large");
     const patch = std.json.parseFromSliceLeaky(SettingsPatch, a, body, .{ .ignore_unknown_fields = false }) catch
         return sendError(req, a, .bad_request, "invalid settings (unknown key or bad value)");
-    var settings = try s.core.getSettings(a);
+    var settings = try s.core.beginEdit(a);
+    defer s.core.endEdit();
     if (patch.model) |m| {
         const found = s.core.catalog.find(m) orelse return sendError(req, a, .bad_request, "unknown model");
         if (found.kind != .voice) return sendError(req, a, .bad_request, "that isn't a voice model");
@@ -609,9 +828,12 @@ fn patchSettings(s: *Server, req: *Exchange, a: std.mem.Allocator) !void {
         if (b.enabled) |v| cur.enabled = v;
         if (b.backend) |v| cur.backend = v;
         if (b.model) |v| cur.model = v;
-        if (b.ollama_url) |v| cur.ollama_url = v;
+        if (b.ollama_url) |v| {
+            if (!briefing_mod.validOllamaUrl(v)) return sendError(req, a, .bad_request, "ollama_url must be an http:// or https:// address");
+            cur.ollama_url = v;
+        }
         if (b.min_words) |v| cur.min_words = v;
-        if (b.timeout_seconds) |v| cur.timeout_seconds = @max(v, 3);
+        if (b.timeout_seconds) |v| cur.timeout_seconds = briefing_mod.clampTimeout(v);
         if (b.listen) |v| cur.listen = v;
         if (b.listen_seconds) |v| cur.listen_seconds = std.math.clamp(v, 2, 8);
         if (b.recognizer) |v| cur.recognizer = v;
@@ -646,8 +868,26 @@ fn pairRequest(s: *Server, req: *http.Server.Request, a: std.mem.Allocator, orig
     s.io.random(&n);
     _ = std.fmt.bufPrint(&p.code, "{d:0>4}", .{std.mem.readInt(u16, &n, .little) % 10000}) catch unreachable;
     @memcpy(p.origin[0..o.len], o);
+    const now = nowMs(s.io);
+    p.created_ms = now;
+    const origin_hash = std.hash.Wyhash.hash(0, o);
 
     s.pairing.mu.lockUncancelable(s.io);
+    // one request may wait for an answer at a time, so an extension can't
+    // stack up dialogs; a denied one waits before it may ask again
+    for (&s.pairing.items) |*it| if (it.*) |*q| if (q.status == .pending and now - q.created_ms > Pairing.pending_ms) {
+        it.* = null;
+    };
+    const waiting = for (s.pairing.items) |it| {
+        if (it) |q| if (q.status == .pending) break true;
+    } else false;
+    const cooling = for (s.pairing.denied) |d| {
+        if (d.origin_hash == origin_hash and now < d.until_ms) break true;
+    } else false;
+    if (waiting or cooling) {
+        s.pairing.mu.unlock(s.io);
+        return respondError(req, a, .too_many_requests, if (waiting) "another pairing request is waiting for an answer" else "denied recently; try again in a minute");
+    }
     p.id = s.pairing.next_id;
     s.pairing.next_id += 1;
     // keep the newest 8 requests
@@ -692,7 +932,7 @@ fn pairStatus(s: *Server, req: *http.Server.Request, a: std.mem.Allocator, id_te
             },
             .approved => {
                 status = "approved";
-                token = s.token;
+                token = try a.dupe(u8, &p.token);
                 slot.* = null; // the token is handed out once
             },
         }
@@ -721,7 +961,10 @@ fn pairAdmin(s: *Server, req: *Exchange, a: std.mem.Allocator, method: http.Meth
         const F = struct { origin: []const u8 };
         const f = std.json.parseFromSliceLeaky(F, a, req.body, .{ .ignore_unknown_fields = true }) catch
             return sendError(req, a, .bad_request, "origin required");
-        var settings = try s.core.getSettings(a);
+        // revoke the token first: from here on the extension is out
+        try revokeExtension(s, f.origin);
+        var settings = try s.core.beginEdit(a);
+        defer s.core.endEdit();
         var keep: std.ArrayList([]const u8) = .empty;
         for (settings.paired_origins) |o| if (!std.mem.eql(u8, o, f.origin)) try keep.append(a, o);
         settings.paired_origins = keep.items;
@@ -735,16 +978,30 @@ fn pairAdmin(s: *Server, req: *Exchange, a: std.mem.Allocator, method: http.Meth
         const approve = std.mem.eql(u8, rest[slash + 1 ..], "approve");
         if (!approve and !std.mem.eql(u8, rest[slash + 1 ..], "deny")) return sendError(req, a, .not_found, "not found");
 
+        // the extension's own token, stored (hashed) before it can collect it
+        const token = try issueExtensionToken(s);
         var origin: ?[]const u8 = null;
         s.pairing.mu.lockUncancelable(s.io);
+        const now = nowMs(s.io);
         for (&s.pairing.items) |*slot| if (slot.*) |*p| if (p.id == id and p.status == .pending) {
-            p.status = if (approve) .approved else .denied;
-            origin = try a.dupe(u8, p.originStr());
+            origin = a.dupe(u8, p.originStr()) catch null;
+            if (approve) {
+                p.token = token;
+            } else {
+                // remember the denial (oldest entry makes room)
+                var oldest: usize = 0;
+                for (s.pairing.denied, 0..) |d, k| if (d.until_ms < s.pairing.denied[oldest].until_ms) {
+                    oldest = k;
+                };
+                s.pairing.denied[oldest] = .{ .origin_hash = std.hash.Wyhash.hash(0, p.originStr()), .until_ms = now + Pairing.denied_cooldown_ms };
+            }
         };
         s.pairing.mu.unlock(s.io);
         const o = origin orelse return sendError(req, a, .not_found, "no pending pairing with that id");
         if (approve) {
-            var settings = try s.core.getSettings(a);
+            try storeExtensionToken(s, o, &token);
+            var settings = try s.core.beginEdit(a);
+            defer s.core.endEdit();
             const already = for (settings.paired_origins) |x| {
                 if (std.mem.eql(u8, x, o)) break true;
             } else false;
@@ -756,6 +1013,12 @@ fn pairAdmin(s: *Server, req: *Exchange, a: std.mem.Allocator, method: http.Meth
                 try s.core.setSettings(settings);
             }
         }
+        // only now may the extension collect its token (or learn it was denied)
+        s.pairing.mu.lockUncancelable(s.io);
+        for (&s.pairing.items) |*slot| if (slot.*) |*p| if (p.id == id and p.status == .pending) {
+            p.status = if (approve) .approved else .denied;
+        };
+        s.pairing.mu.unlock(s.io);
         return sendJson(req, a, .ok, .{ .ok = true, .origin = o, .approved = approve });
     }
     return sendError(req, a, .not_found, "not found");
@@ -786,9 +1049,14 @@ fn events(s: *Server, req: *http.Server.Request, a: std.mem.Allocator) !void {
             },
         },
     });
+    _ = a;
     var after = s.core.currentSeq();
     var batch: [64]core_mod.Event = undefined;
     var since_ping: u64 = 0;
+    // a stream can stay open for days: event JSON goes in a scratch arena
+    // that is reset for every batch, not the request arena
+    var scratch: std.heap.ArenaAllocator = .init(s.gpa);
+    defer scratch.deinit();
     try body.writer.writeAll(": connected\n\n");
     try body.writer.flush(); // drain into the chunked stream
     try body.flush(); // then push the socket buffer
@@ -804,9 +1072,10 @@ fn events(s: *Server, req: *http.Server.Request, a: std.mem.Allocator) !void {
             }
             continue;
         }
+        _ = scratch.reset(.retain_capacity);
         for (batch[0..n]) |*e| {
             after = e.seq;
-            const json = try eventJson(a, e);
+            const json = try eventJson(scratch.allocator(), e);
             try body.writer.print("event: {s}\ndata: {s}\n\n", .{ @tagName(e.kind), json });
         }
         try body.writer.flush(); // drain into the chunked stream
